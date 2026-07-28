@@ -11,6 +11,7 @@ import { toast } from 'sonner';
 import ExcelJS from 'exceljs';
 import { stripEmoji } from '../utils/pdfGenerator';
 import { computeGoalDynamicBalance } from '../utils/goalBalanceEngine';
+import { OVERRIDE_SWEPT, getClosureClass, computeGoalLifecycleData } from '../utils/goalLifecycle';
 import { format } from 'date-fns';
 
 // Shared CSS template for all report print windows with proper scrolling
@@ -1074,35 +1075,8 @@ printWindow.document.write(`
       );
       totalSweepVolume = sweepExpenses.reduce((sum, e) => sum + Math.abs(e.amount || 0), 0);
 
-      const fmtPKR = (cents: number): string =>
-        (cents / 100).toLocaleString('en-PK', { minimumFractionDigits: 2 });
-
-      const getClosureClass = (goal: any): string => {
-        const goalNameUpper = String(goal.name).replace(/\s+/g, '').toUpperCase();
-        if (goalNameUpper.includes('COW')) {
-          return 'Fixed Assets | Livestock & Agriculture';
-        }
-        if (goalNameUpper.includes('EMERGENCY')) {
-          return 'Emergency Reserves | Contingency Fund';
-        }
-        const cat = goal.system_category || '';
-        const sub = goal.system_subcategory || '';
-        const text = `${cat} ${sub}`.toUpperCase();
-        if (/(LIVESTOCK|AGRICULTURE)/i.test(text)) return 'Livestock & Agriculture';
-        if (/(VEHICLE|CAR|BIKE|TRUCK)/i.test(text)) return 'Vehicle Purchase';
-        if (/(PROPERTY|HOUSE|LAND)/i.test(text)) return 'Property Acquisition';
-        if (/(GADGETS|TECH|ELECTRONICS|LAPTOP|IPHONE)/i.test(text)) return 'Gadgets & Tech Gear';
-        if (/(INVESTMENTS|BUSINESS|CAPITAL)/i.test(text)) return 'Business & Capital';
-        if (/(WEDDING|MILESTONES|EVENTS)/i.test(text)) return 'Special Events';
-        if (/(TRAVEL|VACATION|HOLIDAY)/i.test(text)) return 'Holiday Disbursal';
-        if (/(EDUCATION|TUITION|TRAINING)/i.test(text)) return 'Tuition & Training';
-        if (/(EMERGENCY|CONTINGENCY)/i.test(text)) return 'Contingency Fund';
-        return 'Asset Acquisition';
-      };
-
-      const OVERRIDE_SWEPT: Record<string, number> = {
-        'COW': 5000000, // 50,000.00 PKR in cents
-      };
+      const fmtAmount = (cents: number): string =>
+        formatMoney(cents, baseCurrency);
 
       const fmtDate = (d: Date) =>
         `${String(d.getMonth() + 1).padStart(2, '0')}/${String(d.getDate()).padStart(2, '0')}/${d.getFullYear()}`;
@@ -1111,105 +1085,50 @@ printWindow.document.write(`
       const auditHtml: string[] = [];
 
       allGoals.forEach((goal, idx) => {
-        const totalTargetCents = goal.target_amount || 0;
-        const goalNameUpper = stripEmoji(goal.name).trim().toUpperCase();
-        const goalNameClean = stripEmoji(String(goal.name));
-        const goalDynamicBalance = computeGoalDynamicBalance(goal.name, allExpenses);
-
-        const sweptSavedCents = OVERRIDE_SWEPT[goalNameUpper] ?? (goalDynamicBalance || goal.current_amount || 0);
-
-        const descContainsGoal = (desc: string) => String(desc).includes(goalNameClean) || String(desc).includes(goal.name);
-        const disbursedCents = allExpenses
-          .filter((e) => String(e.description || '').includes('(Goal Fulfilled)') && descContainsGoal(String(e.description || '')))
-          .reduce((sum, e) => sum + Math.abs(Number(e.amount) || 0), 0);
-        const reallocEvents = allExpenses
-          .filter((e) => String(e.description || '').startsWith('Reallocated') && descContainsGoal(String(e.description || '')))
-          .map((e) => ({ amount: Math.abs(Number(e.amount) || 0), desc: String(e.description || '') }));
-        const reallocatedCents = reallocEvents.reduce((sum, r) => sum + r.amount, 0);
-        const lastDestMatch = reallocEvents.length > 0 ? reallocEvents[reallocEvents.length - 1].desc.match(/"([^"]+)" funds to "([^"]+)"/) : null;
-        const lastDestName = lastDestMatch ? lastDestMatch[2] : null;
-
-        const isFulfilled = goalNameUpper === 'COW' || goalDynamicBalance >= totalTargetCents;
-        const status = isFulfilled ? 'Fulfilled' : 'Active';
-        const statusBadge = isFulfilled
+        const d = computeGoalLifecycleData(goal, allExpenses, allGoals);
+        const status = d.isFulfilled ? 'Fulfilled' : 'Active';
+        const statusBadge = d.isFulfilled
           ? '<span style="background:#d1fae5;color:#065f46;padding:3px 8px;border-radius:4px;font-size:10px;font-weight:700;">Fulfilled</span>'
           : '<span style="background:#dbeafe;color:#1e40af;padding:3px 8px;border-radius:4px;font-size:10px;font-weight:700;">Active</span>';
 
-        const incomingEvents = allExpenses.filter(e => {
-          const d = String(e.description || '');
-          const match = d.match(/"([^"]+)" funds to "([^"]+)"/);
-          return !!match && match[2] === goalNameClean && d.startsWith('Reallocated');
-        });
-        const incomingCents = incomingEvents.reduce((s, e) => s + Math.abs(Number(e.amount) || 0), 0);
-        const incomingNames = [...new Set(incomingEvents.map(e => {
-          const m = String(e.description || '').match(/"([^"]+)" funds to "([^"]+)"/);
-          return m ? m[1] : '';
-        }))].filter(Boolean);
-
-        const otherActiveGoals = allGoals.filter(g => {
-          if (g.id === goal.id) return false;
-          const gUpper = stripEmoji(g.name).trim().toUpperCase();
-          const gBal = computeGoalDynamicBalance(g.name, allExpenses);
-          const gFulfilled = gUpper === 'COW' || gBal >= (g.target_amount || 0);
-          return !gFulfilled;
-        });
-        const fallbackDest = otherActiveGoals.length === 1
-          ? stripEmoji(String(otherActiveGoals[0].name))
-          : 'Emergency Fund';
-        const finalDisbursedCents = isFulfilled
-          ? (disbursedCents > 0 ? disbursedCents : sweptSavedCents * 0.5)
-          : disbursedCents;
-        const finalReallocatedCents = isFulfilled
-          ? (reallocatedCents > 0 ? reallocatedCents : 500000)
-          : reallocatedCents;
-        const finalLastDestName = isFulfilled
-          ? (lastDestName || fallbackDest)
-          : (lastDestName || 'Emergency Fund');
-        const finalRetainedCents = isFulfilled
-          ? sweptSavedCents - finalDisbursedCents - finalReallocatedCents
-          : Math.max(0, sweptSavedCents - disbursedCents - reallocatedCents);
-
-        if (isFulfilled) completedCount++;
+        if (d.isFulfilled) completedCount++;
         else activeCount++;
 
-        const remainingCents = isFulfilled ? 0 : Math.max(0, totalTargetCents - sweptSavedCents);
-        const netLedgerCents = sweptSavedCents - disbursedCents - reallocatedCents;
-        const totalPool = isFulfilled ? sweptSavedCents : totalTargetCents;
-        const pct = (val: number) => totalPool > 0 ? ((val / totalPool) * 100).toFixed(2) : '0.00';
+        const pct = (val: number) => d.totalPool > 0 ? ((val / d.totalPool) * 100).toFixed(2) : '0.00';
 
         const closureClass = getClosureClass(goal);
 
         tableRows.push(`<tr>
-          <td style="font-weight:600;">${goalNameClean}</td>
+          <td style="font-weight:600;">${d.goalNameClean}</td>
           <td>${statusBadge}</td>
-          <td>PKR ${fmtPKR(totalTargetCents)}</td>
-          <td>PKR ${fmtPKR(sweptSavedCents)}</td>
-          <td>PKR ${fmtPKR(netLedgerCents)}</td>
-          <td>PKR ${fmtPKR(remainingCents)}</td>
+          <td>${fmtAmount(d.totalTargetCents)}</td>
+          <td>${fmtAmount(d.sweptSavedCents)}</td>
+          <td>${fmtAmount(d.netLedgerCents)}</td>
+          <td>${fmtAmount(d.remainingCents)}</td>
           <td>${closureClass}</td>
         </tr>`);
 
         const idxStr = String(idx + 1).padStart(2, '0');
         const fd = fmtDate(new Date());
 
-        if (isFulfilled) {
-          auditHtml.push(`<div class="audit-entry"><div class="audit-header">[${idxStr}] AUDIT SYNC \u2022 ${goalNameClean.toUpperCase()}</div>`);
+        if (d.isFulfilled) {
+          auditHtml.push(`<div class="audit-entry"><div class="audit-header">[${idxStr}] AUDIT SYNC \u2022 ${d.goalNameClean.toUpperCase()}</div>`);
           auditHtml.push(`<div class="audit-line">\u251C\u2500\u2500 STATUS          : <span class="audit-fulfilled">FULFILLED</span> (${fd})</div>`);
-          auditHtml.push(`<div class="audit-line">\u251C\u2500\u2500 ASSET DISBURSED : PKR ${fmtPKR(finalDisbursedCents)} (${pct(finalDisbursedCents)}% executed for asset acquisition)</div>`);
-          auditHtml.push(`<div class="audit-line">\u251C\u2500\u2500 CAPITAL SWEEP   : PKR ${fmtPKR(finalReallocatedCents)} (${pct(finalReallocatedCents)}% reallocated directly to ${finalLastDestName} vault)</div>`);
-          auditHtml.push(`<div class="audit-line">\u2514\u2500\u2500 RECOVERY RETURN : PKR ${fmtPKR(finalRetainedCents)} (${pct(finalRetainedCents)}% returned to core liquid cash)</div>`);
-          if (incomingCents > 0) {
-            auditHtml.push(`<div class="audit-line">\u2514\u2500\u2500 INJECTED SURPLUS: PKR ${fmtPKR(incomingCents)} (Transferred from ${incomingNames.join(', ')} lifecycle closure)</div>`);
+          auditHtml.push(`<div class="audit-line">\u251C\u2500\u2500 ASSET DISBURSED : ${fmtAmount(d.finalDisbursedCents)} (${pct(d.finalDisbursedCents)}% executed for asset acquisition)</div>`);
+          auditHtml.push(`<div class="audit-line">\u251C\u2500\u2500 CAPITAL SWEEP   : ${fmtAmount(d.finalReallocatedCents)} (${pct(d.finalReallocatedCents)}% reallocated directly to ${d.finalLastDestName} vault)</div>`);
+          auditHtml.push(`<div class="audit-line">\u2514\u2500\u2500 RECOVERY RETURN : ${fmtAmount(d.finalRetainedCents)} (${pct(d.finalRetainedCents)}% returned to core liquid cash)</div>`);
+          if (d.incomingCents > 0) {
+            auditHtml.push(`<div class="audit-line">\u2514\u2500\u2500 INJECTED SURPLUS: ${fmtAmount(d.incomingCents)} (Transferred from ${d.incomingNames.join(', ')} lifecycle closure)</div>`);
           }
           auditHtml.push(`</div>`);
         } else {
-          auditHtml.push(`<div class="audit-entry"><div class="audit-header">[${idxStr}] AUDIT SYNC \u2022 ${goalNameClean.toUpperCase()}</div>`);
+          auditHtml.push(`<div class="audit-entry"><div class="audit-header">[${idxStr}] AUDIT SYNC \u2022 ${d.goalNameClean.toUpperCase()}</div>`);
           auditHtml.push(`<div class="audit-line">\u251C\u2500\u2500 STATUS          : <span class="audit-active">ACTIVE</span> (Accumulating)</div>`);
-          auditHtml.push(`<div class="audit-line">\u251C\u2500\u2500 SWEPT TO DATE   : PKR ${fmtPKR(sweptSavedCents)} (${pct(sweptSavedCents)}% secured via auto-sweep loops)</div>`);
-          if (incomingCents > 0) {
-            auditHtml.push(`<div class="audit-line">\u251C\u2500\u2500 INJECTED SURPLUS: PKR ${fmtPKR(incomingCents)} (Transferred from ${incomingNames.join(', ')} lifecycle closure)</div>`);
+          auditHtml.push(`<div class="audit-line">\u251C\u2500\u2500 SWEPT TO DATE   : ${fmtAmount(d.sweptSavedCents)} (${pct(d.sweptSavedCents)}% secured via auto-sweep loops)</div>`);
+          if (d.incomingCents > 0) {
+            auditHtml.push(`<div class="audit-line">\u251C\u2500\u2500 INJECTED SURPLUS: ${fmtAmount(d.incomingCents)} (Transferred from ${d.incomingNames.join(', ')} lifecycle closure)</div>`);
           }
-          auditHtml.push(`<div class="audit-line">\u2514\u2500\u2500 FUNDING GAP     : PKR ${fmtPKR(remainingCents)} (${pct(remainingCents)}% required to satisfy target)</div>`);
+          auditHtml.push(`<div class="audit-line">\u2514\u2500\u2500 FUNDING GAP     : ${fmtAmount(d.remainingCents)} (${pct(d.remainingCents)}% required to satisfy target)</div>`);
           auditHtml.push(`</div>`);
         }
       });
@@ -1376,7 +1295,7 @@ ${scrollableDocumentScript()}
                     <div class="metric-item">Open Slot Allocation : ${completedCount + activeCount}/5 Max Capacity</div>
                     <div class="metric-item">Completed Lifecycle: ${completedCount} Vault</div>
                     <div class="metric-item">Active Accumulations : ${activeCount} Vaults</div>
-                    <div class="metric-item">Total Sweep Volume : PKR ${fmtPKR(totalSweepVolume)}</div>
+                    <div class="metric-item">Total Sweep Volume : ${fmtAmount(totalSweepVolume)}</div>
                   </div>
                 </div>
 
@@ -1407,36 +1326,6 @@ ${scrollableDocumentScript()}
     setIsExporting('excel');
     try {
       const allGoals = await db.savings_goals.toArray();
-
-      const getClosureClass = (goal: any): string => {
-        const goalNameUpper = String(goal.name).replace(/\s+/g, '').toUpperCase();
-        if (goalNameUpper.includes('COW')) {
-          return 'Fixed Assets | Livestock & Agriculture';
-        }
-        if (goalNameUpper.includes('EMERGENCY')) {
-          return 'Emergency Reserves | Contingency Fund';
-        }
-        const cat = goal.system_category || '';
-        const sub = goal.system_subcategory || '';
-        const text = `${cat} ${sub}`.toUpperCase();
-        if (/(LIVESTOCK|AGRICULTURE)/i.test(text)) return 'Livestock & Agriculture';
-        if (/(VEHICLE|CAR|BIKE|TRUCK)/i.test(text)) return 'Vehicle Purchase';
-        if (/(PROPERTY|HOUSE|LAND)/i.test(text)) return 'Property Acquisition';
-        if (/(GADGETS|TECH|ELECTRONICS|LAPTOP|IPHONE)/i.test(text)) return 'Gadgets & Tech Gear';
-        if (/(INVESTMENTS|BUSINESS|CAPITAL)/i.test(text)) return 'Business & Capital';
-        if (/(WEDDING|MILESTONES|EVENTS)/i.test(text)) return 'Special Events';
-        if (/(TRAVEL|VACATION|HOLIDAY)/i.test(text)) return 'Holiday Disbursal';
-        if (/(EDUCATION|TUITION|TRAINING)/i.test(text)) return 'Tuition & Training';
-        if (/(EMERGENCY|CONTINGENCY)/i.test(text)) return 'Contingency Fund';
-        return 'Asset Acquisition';
-      };
-
-      const OVERRIDE_SWEPT: Record<string, number> = {
-        'COW': 5000000,
-      };
-
-      const fmtUnit = (cents: number): string =>
-        (cents / 100).toLocaleString('en-PK', { minimumFractionDigits: 2 });
 
       const currencyFormat = '"Rs"#,##0.00;("Rs"#,##0.00);"-"';
       const auditLines: string[] = [];
@@ -1471,120 +1360,48 @@ ${scrollableDocumentScript()}
       for (let i = 0; i < allGoals.length; i++) {
         const goal = allGoals[i];
         goal.name = sanitizeStr(goal.name);
-        const goalNameClean = stripEmoji(goal.name).trim();
-        const goalNameUpper = goalNameClean.toUpperCase();
-        const totalTargetCents = goal.target_amount || 0;
-        const totalTargetUnits = totalTargetCents / 100;
-        const goalDynamicBalanceExcel = computeGoalDynamicBalance(goal.name, allExpenses);
-
-        const descContainsGoal = (desc: string) => String(desc).includes(goalNameClean) || String(desc).includes(goal.name);
-        const sweptSavedCents = OVERRIDE_SWEPT[goalNameUpper] ?? (goalDynamicBalanceExcel || goal.current_amount || 0);
-        const sweptSavedUnits = sweptSavedCents / 100;
-        const disbursedCents = allExpenses
-          .filter((e) => String(e.description || '').includes('(Goal Fulfilled)') && descContainsGoal(String(e.description || '')))
-          .reduce((sum, e) => sum + Math.abs(Number(e.amount) || 0), 0);
-        const reallocEvents = allExpenses
-          .filter((e) => String(e.description || '').startsWith('Reallocated') && descContainsGoal(String(e.description || '')))
-          .map((e) => ({ amount: Math.abs(Number(e.amount) || 0), desc: String(e.description || '') }));
-        const reallocatedCents = reallocEvents.reduce((sum, r) => sum + r.amount, 0);
-        const lastDestMatch = reallocEvents.length > 0 ? reallocEvents[reallocEvents.length - 1].desc.match(/"([^"]+)" funds to "([^"]+)"/) : null;
-        const lastDestName = lastDestMatch ? lastDestMatch[2] : null;
-
-        // Status: fulfilled if dynamic balance >= target or explicit override
-        const isFulfilled = goalNameUpper === 'COW' || goalDynamicBalanceExcel >= totalTargetCents;
-        const status = isFulfilled ? 'Fulfilled' : 'Active';
-
-        // Dynamic lifecycle split for fulfilled goals: 50% Asset / 25% Sweep / 25% Return
-        const otherActiveGoals = allGoals.filter(g => {
-          if (g.id === goal.id) return false;
-          const gUpper = stripEmoji(g.name).trim().toUpperCase();
-          const gBal = computeGoalDynamicBalance(g.name, allExpenses);
-          const gFulfilled = gUpper === 'COW' || gBal >= (g.target_amount || 0);
-          return !gFulfilled;
-        });
-        const fallbackDest = otherActiveGoals.length === 1
-          ? stripEmoji(String(otherActiveGoals[0].name))
-          : 'Emergency Fund';
-        // Detect incoming cross-vault capital injection (transfers TO this goal)
-        const incomingEvents = allExpenses.filter(e => {
-          const d = String(e.description || '');
-          const match = d.match(/"([^"]+)" funds to "([^"]+)"/);
-          return !!match && match[2] === goalNameClean && d.startsWith('Reallocated');
-        });
-        const incomingCents = incomingEvents.reduce((s, e) => s + Math.abs(Number(e.amount) || 0), 0);
-        const incomingNames = [...new Set(incomingEvents.map(e => {
-          const m = String(e.description || '').match(/"([^"]+)" funds to "([^"]+)"/);
-          return m ? m[1] : '';
-        }))].filter(Boolean);
-
-        // Dynamic lifecycle split: use real transaction amount when available, else 50% baseline fallback
-        const finalDisbursedCents = isFulfilled
-          ? (disbursedCents > 0 ? disbursedCents : sweptSavedCents * 0.5)
-          : disbursedCents;
-        const finalReallocatedCents = isFulfilled
-          ? (reallocatedCents > 0 ? reallocatedCents : 500000)
-          : reallocatedCents;
-        const finalLastDestName = isFulfilled
-          ? (lastDestName || fallbackDest)
-          : (lastDestName || 'Emergency Fund');
-        const finalRetainedCents = isFulfilled
-          ? sweptSavedCents - finalDisbursedCents - finalReallocatedCents
-          : Math.max(0, sweptSavedCents - disbursedCents - reallocatedCents);
-
-        const netLedgerUnits = (sweptSavedCents - disbursedCents - reallocatedCents) / 100;
-        const remainingUnits = isFulfilled ? 0 : Math.max(0, totalTargetUnits - sweptSavedUnits);
-        const totalPool = isFulfilled ? sweptSavedCents : totalTargetCents;
-        const pct = (val: number) => totalPool > 0 ? ((val / totalPool) * 100).toFixed(2) : '0.00';
-
+        const d = computeGoalLifecycleData(goal, allExpenses, allGoals);
+        const status = d.isFulfilled ? 'Fulfilled' : 'Active';
+        const sweptSavedUnits = d.sweptSavedCents / 100;
+        const netLedgerUnits = d.netLedgerCents / 100;
+        const remainingUnits = d.isFulfilled ? 0 : Math.max(0, (d.totalTargetCents / 100) - sweptSavedUnits);
+        const pct = (val: number) => d.totalPool > 0 ? ((val / d.totalPool) * 100).toFixed(2) : '0.00';
         const closureClass = getClosureClass(goal);
 
         const rowNum = dataStartRow + i;
 
-        // Column A: Goal Name
-        worksheet.getCell(`A${rowNum}`).value = goalNameClean;
-
-        // Column B: Status
+        worksheet.getCell(`A${rowNum}`).value = d.goalNameClean;
         worksheet.getCell(`B${rowNum}`).value = status;
-
-        // Column C: Total Target (raw number, formatted via numFmt)
-        worksheet.getCell(`C${rowNum}`).value = totalTargetUnits;
+        worksheet.getCell(`C${rowNum}`).value = d.totalTargetCents / 100;
         worksheet.getCell(`C${rowNum}`).numFmt = currencyFormat;
-
-        // Column D: Swept (Historical)
         worksheet.getCell(`D${rowNum}`).value = sweptSavedUnits;
         worksheet.getCell(`D${rowNum}`).numFmt = currencyFormat;
-
-        // Column E: Net Ledger Balance
         worksheet.getCell(`E${rowNum}`).value = netLedgerUnits;
         worksheet.getCell(`E${rowNum}`).numFmt = currencyFormat;
-
-        // Column F: Remaining Balance → Excel formula =C-D
         worksheet.getCell(`F${rowNum}`).value = { formula: `C${rowNum}-D${rowNum}`, result: remainingUnits };
         worksheet.getCell(`F${rowNum}`).numFmt = currencyFormat;
-
-        // Column G: Closure Class
         worksheet.getCell(`G${rowNum}`).value = closureClass;
 
         const idxStr = String(i + 1).padStart(2, '0');
         const fd = `${String(new Date().getMonth() + 1).padStart(2, '0')}/${String(new Date().getDate()).padStart(2, '0')}/${new Date().getFullYear()}`;
 
-        if (isFulfilled) {
-          auditLines.push(`[${idxStr}] AUDIT SYNC \u2022 ${goalNameClean.toUpperCase()}`);
+        if (d.isFulfilled) {
+          auditLines.push(`[${idxStr}] AUDIT SYNC \u2022 ${d.goalNameClean.toUpperCase()}`);
           auditLines.push(`     \u251C\u2500\u2500 STATUS          : FULFILLED (${fd})`);
-          auditLines.push(`     \u251C\u2500\u2500 ASSET DISBURSED : Rs${fmtUnit(finalDisbursedCents)} (${pct(finalDisbursedCents)}% executed for asset acquisition)`);
-          auditLines.push(`     \u251C\u2500\u2500 CAPITAL SWEEP   : Rs${fmtUnit(finalReallocatedCents)} (${pct(finalReallocatedCents)}% reallocated directly to ${finalLastDestName} vault)`);
-          auditLines.push(`     \u2514\u2500\u2500 RECOVERY RETURN : Rs${fmtUnit(finalRetainedCents)} (${pct(finalRetainedCents)}% returned to core liquid cash)`);
-          if (incomingCents > 0) {
-            auditLines.push(`     \u2514\u2500\u2500 INJECTED SURPLUS: Rs${fmtUnit(incomingCents)} (Transferred from ${incomingNames.join(', ')} lifecycle closure)`);
+          auditLines.push(`     \u251C\u2500\u2500 ASSET DISBURSED : ${formatMoney(d.finalDisbursedCents, baseCurrency)} (${pct(d.finalDisbursedCents)}% executed for asset acquisition)`);
+          auditLines.push(`     \u251C\u2500\u2500 CAPITAL SWEEP   : ${formatMoney(d.finalReallocatedCents, baseCurrency)} (${pct(d.finalReallocatedCents)}% reallocated directly to ${d.finalLastDestName} vault)`);
+          auditLines.push(`     \u2514\u2500\u2500 RECOVERY RETURN : ${formatMoney(d.finalRetainedCents, baseCurrency)} (${pct(d.finalRetainedCents)}% returned to core liquid cash)`);
+          if (d.incomingCents > 0) {
+            auditLines.push(`     \u2514\u2500\u2500 INJECTED SURPLUS: ${formatMoney(d.incomingCents, baseCurrency)} (Transferred from ${d.incomingNames.join(', ')} lifecycle closure)`);
           }
         } else {
-          auditLines.push(`[${idxStr}] AUDIT SYNC \u2022 ${goalNameClean.toUpperCase()}`);
+          auditLines.push(`[${idxStr}] AUDIT SYNC \u2022 ${d.goalNameClean.toUpperCase()}`);
           auditLines.push(`     \u251C\u2500\u2500 STATUS          : ACTIVE (Accumulating)`);
-          auditLines.push(`     \u251C\u2500\u2500 SWEPT TO DATE   : Rs${fmtUnit(sweptSavedCents)} (${pct(sweptSavedCents)}% secured via auto-sweep loops)`);
-          if (incomingCents > 0) {
-            auditLines.push(`     \u251C\u2500\u2500 INJECTED SURPLUS: Rs${fmtUnit(incomingCents)} (Transferred from ${incomingNames.join(', ')} lifecycle closure)`);
+          auditLines.push(`     \u251C\u2500\u2500 SWEPT TO DATE   : ${formatMoney(d.sweptSavedCents, baseCurrency)} (${pct(d.sweptSavedCents)}% secured via auto-sweep loops)`);
+          if (d.incomingCents > 0) {
+            auditLines.push(`     \u251C\u2500\u2500 INJECTED SURPLUS: ${formatMoney(d.incomingCents, baseCurrency)} (Transferred from ${d.incomingNames.join(', ')} lifecycle closure)`);
           }
-          auditLines.push(`     \u2514\u2500\u2500 FUNDING GAP     : Rs${fmtUnit(isFulfilled ? 0 : Math.max(0, totalTargetCents - sweptSavedCents))} (${pct(isFulfilled ? 0 : Math.max(0, totalTargetCents - sweptSavedCents))}% required to satisfy target)`);
+          auditLines.push(`     \u2514\u2500\u2500 FUNDING GAP     : ${formatMoney(d.remainingCents, baseCurrency)} (${pct(d.remainingCents)}% required to satisfy target)`);
         }
       }
 

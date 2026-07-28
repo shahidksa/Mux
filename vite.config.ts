@@ -6,9 +6,10 @@ export default defineConfig({
   plugins: [tailwindcss(), react()],
   
   server: {
-    host: '127.0.0.1',
+    host: '0.0.0.0',
+    allowedHosts: ['.monkeycode-ai.live'],
     hmr: {
-      overlay: false // Keeps development lighter on memory
+      overlay: false
     }
   },
 
