@@ -112,7 +112,7 @@ const getReportStyles = (isDarkMode: boolean) => `
 /* Different heights for different tables */
 .table-scroll-container.budget-scroll { max-height: 240px; }
 .table-scroll-container.activity-scroll { max-height: 320px; }
-.table-scroll-container.audit-scroll { height: 200px; overflow-y: scroll !important; }
+.table-scroll-container.audit-scroll { max-height: 600px; }
 
 /* Tables */
 .table-scroll-container {
@@ -663,7 +663,7 @@ printWindow.document.write(`
                       </div>
 
                       <div class="section-title page-break-before" style="color: #c0392b;">TRANSACTION AUDIT LOG (VOIDED & DELETED)</div>
-                      <div class="table-scroll-container audit-scroll avoid-break">
+                      <div class="table-scroll-container audit-scroll avoid-break" style="height:200px;overflow-y:auto;overflow-x:auto">
                         <table style="table-layout: fixed; width: 100%; border-collapse: collapse;">
                           <thead>
                             <tr>
@@ -803,7 +803,7 @@ printWindow.document.write(`
                       </div>
 
                       <div class="section-title page-break-before" style="color: #c0392b;">AUDIT LOG (${targetYear})</div>
-                      <div class="table-scroll-container audit-scroll avoid-break">
+                      <div class="table-scroll-container audit-scroll avoid-break" style="height:200px;overflow-y:auto;overflow-x:auto">
                         <table style="table-layout: fixed; width: 100%; border-collapse: collapse;">
                           <thead>
                             <tr>
@@ -986,7 +986,7 @@ printWindow.document.write(`
                       </div>
 
                       <div class="section-title page-break-before" style="color: #c0392b;">AUDIT LOG</div>
-                      <div class="table-scroll-container audit-scroll avoid-break">
+                      <div class="table-scroll-container audit-scroll avoid-break" style="height:200px;overflow-y:auto;overflow-x:auto">
                         <table style="table-layout: fixed; width: 100%; border-collapse: collapse;">
                           <thead>
                             <tr>
