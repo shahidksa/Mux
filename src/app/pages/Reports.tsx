@@ -117,7 +117,10 @@ const getReportStyles = (isDarkMode: boolean) => `
 /* Tables */
 .table-scroll-container {
   overflow-y: auto !important;
+  overflow-x: auto;
   -webkit-overflow-scrolling: touch !important;
+  flex-shrink: 0;
+  min-height: 0;
 }
 table { table-layout: fixed !important; width: 100% !important; border-collapse: collapse !important; font-size: 12px; }
 th { 
