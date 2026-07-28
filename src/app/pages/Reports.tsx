@@ -68,7 +68,7 @@ const getReportStyles = (isDarkMode: boolean) => `
        min-height: 0 !important; padding: 0 16px 16px 16px;
        align-items: center; /* center the zoomWrapper horizontally */
      }
-     .report-content-scroll.fit-to-screen { overflow: hidden !important; }
+     .report-content-scroll.fit-to-screen { overflow: auto !important; }
 
     /* Zoom wrapper - the document sheet */
     #zoomWrapper { 
@@ -1188,12 +1188,12 @@ printWindow.document.write(`
                   background: #ffffff;
                   box-shadow: 0 25px 50px -12px rgba(0,0,0,0.1);
                  }
-                 .report-screen-container { width: 100%; height: 100vh; overflow: hidden; display: flex; flex-direction: column; }
+                 .report-screen-container { width: 100%; height: 100vh; overflow: visible; display: flex; flex-direction: column; }
 .report-content-scroll { 
   flex: 1; overflow-y: auto; display: flex; flex-direction: column; min-height: 0; padding-right: 10px; 
 }
-                 body.fit-to-screen .report-screen-container { overflow: hidden !important; height: 100vh !important; }
-                 body.fit-to-screen .report-content-scroll { overflow: hidden !important; }
+                 body.fit-to-screen .report-screen-container { overflow: visible !important; height: 100vh !important; }
+                 body.fit-to-screen .report-content-scroll { overflow: auto !important; }
 
               @media print {
                 body { font-size: 12px; background: #ffffff; }
