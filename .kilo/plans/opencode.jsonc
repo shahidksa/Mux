@@ -1,0 +1,25 @@
+{
+  "$schema": "https://opencode.ai/config.json",
+
+  // 1. Map models inside the dedicated agents block
+  "agent": {
+    "plan": {
+      "model": "opencode/north-mini-code"
+    },
+    "build": {
+      "model": "opencode/deepseek-v4-flash"
+    }
+  },
+
+  // 2. Fallback main default model required by the CLI
+  "model": "opencode/deepseek-v4-flash",
+
+  // 3. Provider environment mapping
+  "provider": {
+    "opencode": {
+      "options": {
+        "apiKey": "{env:OPENCODE_API_KEY}"
+      }
+    }
+  }
+}

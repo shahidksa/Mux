@@ -1,0 +1,19 @@
+# Ignore frontend build artifact packages
+**/node_modules/
+**/dist/
+**/build/
+.vite/
+
+# Ignore Python runtime clutter
+**/__pycache__/
+**/*.pyc
+**/*.pyo
+**/*.pyd
+.venv/
+env/
+venv/
+.pytest_cache/
+
+# Ignore local env and secrets
+.env
+.env.*

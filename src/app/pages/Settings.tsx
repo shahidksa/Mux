@@ -1,0 +1,3420 @@
+import React, { useState, useEffect, useRef, useMemo, useCallback } from 'react';
+import { Card, CardContent, CardHeader, CardTitle } from '../components/ui/card';
+import { Button } from '../components/ui/button';
+import { Input } from '../components/ui/input';
+import { Label } from '../components/ui/label';
+import { Switch } from '../components/ui/switch';
+import { Separator } from '../components/ui/separator';
+import { Tooltip, TooltipTrigger, TooltipContent } from '../components/ui/tooltip';
+import { toast } from 'sonner';
+import { useExpenses } from '../context/ExpenseContext';
+import { useSettings } from '../context/SettingsContext';
+import { Plus, Trash2, Wallet, Tag, Pencil, RefreshCw, Download, Upload, AlertTriangle, X, Check, ChevronsUpDown, Lock } from 'lucide-react';
+import ExcelJS from 'exceljs';
+import { convertToBase, CURRENCY_SYMBOLS, ALL_CURRENCIES, DEFAULT_EXCHANGE_RATES, convertCurrency, getAllCurrencies, getCurrencySymbol, CURRENCY_NAMES, WORLD_CURRENCIES } from '../utils/currency';
+import type { CustomCurrency, WorldCurrency } from '../utils/currency';
+import { roundMoney, sumMoney, formatMoney, toCents, parseDollarsToCents } from '../utils/monetary';
+import { useFinancialMetrics } from '../hooks/useFinancialMetrics';
+import { Virtuoso } from 'react-virtuoso';
+import { exportDB, importDB } from 'dexie-export-import';
+import { db, SavingsGoalDb } from '../../db';
+import { toLocalDateString } from '../../utils/dates';
+import { seedCategoriesOnly } from '../../seed';
+import { executeSafeGoalDeletion, findGoalRelatedEntries } from '../services/savingsEngine';
+import { getGlobalForceSweepRef } from '../hooks/useAutoSweep';
+import { GLOBAL_EMOJI_KEYWORDS } from '../utils/emojiDictionary';
+import { CurrencySelector } from '../components/CurrencySelector';
+import jsPDF from 'jspdf';
+import autoTable from 'jspdf-autotable';
+import { renderAuditSummaryNotes, stripEmoji, pdfMoney } from '../utils/pdfGenerator';
+import { computeGoalDynamicBalance } from '../utils/goalBalanceEngine';
+import CategoryRow from '../components/CategoryRow';
+import { IconPicker } from '../components/IconPicker';
+import { CategoryIcon } from '../components/CategoryIcon';
+import { getCategoryColor, getSubCategoryColor } from '../utils/categoryColors';
+import { Dialog, DialogContent, DialogHeader, DialogTitle, DialogDescription, DialogFooter, DialogTrigger, DialogOverlay } from '../components/ui/dialog';
+import { Select, SelectContent, SelectItem, SelectTrigger, SelectValue } from '../components/ui/select';
+import { Popover, PopoverContent, PopoverTrigger } from '../components/ui/popover';
+import { Command, CommandInput, CommandList, CommandEmpty, CommandGroup, CommandItem } from '../components/ui/command';
+
+const ScrollSeekPlaceholder = React.memo(() => (
+  <div className="p-2.5 text-xs text-text-muted">Loading categories…</div>
+));
+
+interface SettingsProps {
+  safetyFloor: number;
+  setSafetyFloor: (value: number) => void;
+  lockedSavings: number;
+  setLockedSavings: (value: number) => void;
+  budgetSurplusRule: 'wallet' | 'sweep';
+  setBudgetSurplusRule: (value: 'wallet' | 'sweep') => void;
+}
+
+export function Settings({ safetyFloor, setSafetyFloor, lockedSavings, setLockedSavings, budgetSurplusRule, setBudgetSurplusRule }: SettingsProps) {
+  const { addWallet, updateWallet, deleteWallet, undoDeleteWallet, addCategory, updateCategory, deleteCategory, undoDeleteCategory, addBudget, updateBudget, deleteBudget, resetAllAppData } = useExpenses();
+  const { baseCurrency, setBaseCurrency, rateMode, setRateMode, exchangeRates, setExchangeRates, allowBudgetAlerts, setAllowBudgetAlerts, customCurrencies, addCustomCurrency, removeCustomCurrency, sweepFrequency, setSweepFrequency, sweepPercentage, setSweepPercentage } = useSettings();
+
+  const [wallets, setWallets] = useState<any[]>([]);
+  const [categories, setCategories] = useState<any[]>([]);
+  const [budgets, setBudgets] = useState<any[]>([]);
+  const [expenses, setExpenses] = useState<any[]>([]);
+
+  const metrics = useFinancialMetrics(expenses, baseCurrency, { safetyFloor, capitalShield: lockedSavings }, wallets, categories);
+  const totalWealthPool = 10000000;
+
+  const [localSafetyFloor, setLocalSafetyFloor] = useState(safetyFloor / 100);
+  const [localCapitalShield, setLocalCapitalShield] = useState(lockedSavings / 100);
+  const [localSweepRatio, setLocalSweepRatio] = useState(sweepPercentage);
+  const [masterValve, setMasterValve] = useState(() => Number(localStorage.getItem('globalMasterValue') || 0));
+  const [localFrequency, setLocalFrequency] = useState<string>(() => {
+    try {
+      const stored = localStorage.getItem('expense_app_settings');
+      if (stored) {
+        const parsed = JSON.parse(stored);
+        const saved = parsed.sweepFrequency;
+        if (saved) return saved;
+      }
+    } catch {}
+    return '';
+  });
+  const [isProcessing, setIsProcessing] = useState(false);
+  const [savedDbSettings, setSavedDbSettings] = useState<any>(null);
+
+  useEffect(() => {
+    (async () => {
+      const s = await db.settings.get(1);
+      if (s) {
+        setSavedDbSettings(s);
+      }
+    })();
+  }, []);
+
+  const maxSafetyFloorAllowed = (totalWealthPool / 100) - localCapitalShield;
+  const maxCapitalShieldAllowed = (totalWealthPool / 100) - localSafetyFloor;
+
+  const handleCustomPercentageChange = (value: string) => {
+    const cleaned = value.replace(/[^0-9]/g, '');
+    const num = Math.max(0, Math.min(100, parseInt(cleaned, 10) || 0));
+    setLocalSweepRatio(num);
+    setIsDirty(true);
+  };
+
+  useEffect(() => {
+    if (window.location.hash === '#notifications') {
+      const el = document.getElementById('notifications-section');
+      if (el) el.scrollIntoView({ behavior: 'smooth' });
+    }
+  }, []);
+  const currencySymbol = CURRENCY_SYMBOLS[baseCurrency] || baseCurrency;
+  const rates = exchangeRates || DEFAULT_EXCHANGE_RATES;
+
+  const [dbCurrencies, setDbCurrencies] = useState<any[]>([]);
+  const fetchCurrencies = useCallback(async () => {
+    const data = await db.currencies.toArray();
+    setDbCurrencies(data);
+  }, []);
+
+  useEffect(() => {
+    fetchCurrencies();
+  }, [fetchCurrencies]);
+  const allCurrencyCodes = useMemo(() => Array.from(new Set([
+    ...getAllCurrencies(customCurrencies),
+    ...dbCurrencies.map(c => c.code)
+  ])), [customCurrencies, dbCurrencies]);
+
+  const [manualRates, setManualRates] = useState<Record<string, string>>({});
+  const [fetchingRates, setFetchingRates] = useState(false);
+  const [baseCurrencyPreferenceState, setBaseCurrencyPreferenceState] = useState(baseCurrency);
+  const [selectedExtensionCode, setSelectedExtensionCode] = useState('');
+
+  const [addCurrencyDialogOpen, setAddCurrencyDialogOpen] = useState(false);
+  const [addCurrencySearchOpen, setAddCurrencySearchOpen] = useState(false);
+  const [selectedWorldCurrency, setSelectedWorldCurrency] = useState<WorldCurrency | null>(null);
+
+  const handleDeleteCurrency = async (code: string) => {
+    const currency = dbCurrencies.find(c => c.code === code);
+    if (currency) {
+      if (currency.isDefault || currency.is_custom === false) {
+        toast.error(`${code} is a system currency and cannot be deleted.`);
+        return;
+      }
+      await db.currencies.delete(currency.id!);
+      await fetchCurrencies();
+    } else if (!customCurrencies.some(c => c.code === code)) {
+      toast.error(`${code} not found.`);
+      return;
+    }
+    removeCustomCurrency(code);
+    const newR = { ...rates };
+    delete newR[code];
+    setExchangeRates(newR);
+    toast.success(`${code} deleted successfully.`);
+  };
+
+  // ============================================================
+  // CURRENCY CONVERSION — SINGLE POINT OF CONVERSION IN THE APP
+  // ============================================================
+  // All wallet balances, goals, budgets, and guardrails are stored
+  // in the base currency. When the user switches currency, we convert
+  // all stored amounts from old currency to new currency using the
+  // exchange rate ratio. After this, all arithmetic continues in the
+  // new base currency with no further conversion needed.
+  //
+  // Conversion factor = newRate / oldRate
+  // Example: USD→PKR = 278/1 = 278, so $1000 becomes ₨278,000
+  // ============================================================
+  // ================================================================
+  // CURRENCY CONVERSION — SINGLE POINT OF CONVERSION IN THE APP
+  // ================================================================
+  // All wallet balances, goals, budgets, and guardrails are stored in
+  // the base currency. When switching currency, multiply everything by
+  // the rate ratio (newRate / oldRate) to convert to the new currency.
+  //
+  // Example: USD→PKR at rate 278 → $1,000 becomes ₨278,000
+  //
+  // Everywhere else in the app uses pure base-currency arithmetic.
+  // ================================================================
+  const handleBaseCurrencyChange = async (value: string) => {
+    const oldBase = baseCurrency;
+    const resolvedRates = exchangeRates || DEFAULT_EXCHANGE_RATES;
+    const newRate = resolvedRates[value] || 1;
+    const oldRate = resolvedRates[oldBase] || 1;
+    const conversionFactor = newRate / oldRate;
+
+    setBaseCurrency(value);
+    setBaseCurrencyPreferenceState(value);
+
+    if (rateMode === 'api') {
+      fetchLiveRates();
+    }
+
+    try {
+      // Step 1: Convert all wallet balances (stored in base currency cents)
+      if (conversionFactor !== 1) {
+        for (const w of wallets) {
+          const convertedBalance = Math.round((w.balance || 0) * conversionFactor);
+          await updateWallet(w.id!, { balance: convertedBalance, currency: value });
+        }
+
+        // Step 2: Convert all savings goal targets and current amounts
+        const allGoals = await db.savings_goals.toArray();
+        for (const goal of allGoals) {
+          const convertedTarget = Math.round((goal.target_amount || 0) * conversionFactor);
+          const convertedCurrent = Math.round((goal.current_amount || 0) * conversionFactor);
+          await db.savings_goals.update(goal.id!, {
+            target_amount: convertedTarget,
+            current_amount: convertedCurrent
+          });
+        }
+
+        // Step 3: Convert all budget limits
+        const allBudgets = await db.budgets.toArray();
+        for (const budget of allBudgets) {
+          const convertedLimit = Math.round((budget.limit_amount || 0) * conversionFactor);
+          await db.budgets.update(budget.id!, { limit_amount: convertedLimit });
+        }
+
+        // Step 3b: Convert all transaction amounts (income/expenses/transfers)
+        const allExpenses = await db.expenses.toArray();
+        for (const exp of allExpenses) {
+          const convertedAmount = Math.round((exp.amount < 0 ? -1 : 1) * Math.abs(exp.amount) * conversionFactor);
+          const convertedAbs = Math.round(Math.abs(exp.amount) * conversionFactor);
+          await db.expenses.update(exp.id!, { amount: exp.amount < 0 ? -convertedAbs : convertedAbs });
+        }
+
+        // Step 4: Convert guardrail settings (safety floor & capital shield)
+        const settings = await db.settings.get(1);
+        if (settings) {
+          const convertedSafetyFloor = Math.round((settings.safety_floor || 0) * conversionFactor);
+          const convertedCapitalShield = Math.round((settings.capital_shield || 0) * conversionFactor);
+          await db.settings.update(1, {
+            safety_floor: convertedSafetyFloor,
+            capital_shield: convertedCapitalShield
+          });
+
+          // Step 4b: Update SettingsContext so banner reflects new values
+          // setSafetyFloor expects dollars; convertedSafetyFloor is in cents → divide by 100
+          setSafetyFloor(Math.round(convertedSafetyFloor) / 100);
+          setCapitalShield(Math.round(convertedCapitalShield) / 100);
+        }
+
+        // Step 5: Update local guardrail display values
+        // localSafetyFloor/localCapitalShield are in dollars (cents/100)
+        // Convert to new currency: multiply dollars by conversionFactor
+        setLocalSafetyFloor((prev) => Math.round(prev * conversionFactor * 100) / 100);
+        setLocalCapitalShield((prev) => Math.round(prev * conversionFactor * 100) / 100);
+      } else {
+        // Same currency selected, just update wallet labels
+        for (const w of wallets) {
+          if (w.currency === oldBase) {
+            await updateWallet(w.id!, { currency: value });
+          }
+        }
+      }
+    } catch (err) {
+      console.error('Currency conversion failed:', err);
+      toast.error('Failed to convert balances to new currency');
+    }
+
+    await fetchWallets();
+  };
+
+  const getDisplayedRate = (targetCurrency: string) => {
+    const targetRate = rates[targetCurrency] || 1;
+    const baseRate = rates[baseCurrency] || 1;
+    return targetRate / baseRate;
+  };
+
+  useEffect(() => {
+    const newManualRates: Record<string, string> = {};
+    for (const curr of allCurrencyCodes) {
+      if (curr === baseCurrency) {
+        newManualRates[curr] = '1';
+        continue;
+      }
+      const display = getDisplayedRate(curr);
+      if (isFinite(display) && display >= 0) {
+        newManualRates[curr] = display < 0.1 ? display.toFixed(5) : display.toFixed(2);
+      } else {
+        newManualRates[curr] = '0.00';
+      }
+    }
+    setManualRates(newManualRates);
+  }, [exchangeRates, baseCurrency, allCurrencyCodes]);
+
+  useEffect(() => {
+    if (rateMode === 'api') {
+      fetchLiveRates();
+    }
+  }, [rateMode, baseCurrency]);
+
+  useEffect(() => {
+    if ((window as any).autoScrollToSavings) {
+      (window as any).autoScrollToSavings = false;
+      setTimeout(() => {
+        const targetCardElement = document.getElementById('manage-savings-goals-section');
+        if (targetCardElement) {
+          targetCardElement.scrollIntoView({ behavior: 'smooth', block: 'center' });
+        }
+      }, 150);
+    }
+  }, []);
+
+  const fetchLiveRates = async () => {
+    setFetchingRates(true);
+    try {
+      const res = await fetch(`https://open.er-api.com/v6/latest/USD`);
+      if (!res.ok) throw new Error(`HTTP ${res.status}`);
+      const data = await res.json();
+      if (data && data.rates) {
+        const apiRates = data.rates as Record<string, number>;
+        const numericRates: Record<string, number> = {};
+        for (const code of allCurrencyCodes) {
+          const liveRate = apiRates[code];
+          if (liveRate !== undefined) {
+            numericRates[code] = Math.round(parseFloat(String(liveRate)) * 1_000_000) / 1_000_000;
+          } else {
+            numericRates[code] = rates[code] || DEFAULT_EXCHANGE_RATES[code] || 1;
+          }
+        }
+        numericRates['USD'] = 1;
+        setExchangeRates(numericRates);
+        toast.success('Exchange rates updated from live API');
+      }
+    } catch (err) {
+      toast.error('Failed to fetch live rates, using offline defaults');
+      toast.warning('Custom currency rates may not be accurate with fallback defaults');
+      const fallbackRates = { 'USD': 1.0, 'PKR': 278, 'EUR': 0.92, 'GBP': 0.79, 'JPY': 149, 'CNY': 7.24, 'INR': 83, 'AUD': 1.53, 'CAD': 1.36, 'SAR': 3.75, 'AED': 3.64, 'QAR': 3.64, 'KWD': 0.31 };
+      setExchangeRates(fallbackRates);
+    } finally {
+      setFetchingRates(false);
+    }
+  };
+
+  const handleManualRateChange = (currency: string, value: string) => {
+    const updated = { ...manualRates, [currency]: value };
+    setManualRates(updated);
+    const baseRate = rates[baseCurrency] || 1;
+    const numValue = parseFloat(value);
+    if (baseRate && !isNaN(numValue) && numValue > 0) {
+      const newRates = { ...rates, [currency]: numValue * baseRate };
+      setExchangeRates(newRates);
+    }
+  };
+  
+  const [newWalletName, setNewWalletName] = useState('');
+  const [newWalletType, setNewWalletType] = useState<'bank' | 'cash' | 'card'>('bank');
+  const [newWalletBalance, setNewWalletBalance] = useState('');
+  const [newWalletCurrency, setNewWalletCurrency] = useState<'USD' | 'EUR' | 'GBP' | 'JPY' | 'CNY' | 'INR' | 'PKR' | 'AUD' | 'CAD' | 'SAR' | 'AED'>(() => (baseCurrency as any) || 'USD');
+  const [walletDialogOpen, setWalletDialogOpen] = useState(false);
+  
+  const [newCategoryName, setNewCategoryName] = useState('');
+  const [newCategoryType, setNewCategoryType] = useState<'expense' | 'income' | 'both'>('expense');
+  const [newCategoryIcon, setNewCategoryIcon] = useState('HelpCircle');
+  const [showIconPicker, setShowIconPicker] = useState(false);
+  const [categoryDialogOpen, setCategoryDialogOpen] = useState(false);
+  const [categoryTypeFilter, setCategoryTypeFilter] = useState<'all' | 'expense' | 'income'>('all');
+  const [isSubcategory, setIsSubcategory] = useState(false);
+  const [selectedParentId, setSelectedParentId] = useState<number | null>(null);
+  const [tempSubs, setTempSubs] = useState<string[]>([]);
+  const [tempSubInput, setTempSubInput] = useState('');
+  const mainCategoryParents = useMemo(() =>
+    categories.filter(c => (c.parent_id === null || c.parent_id === undefined) && c.name !== 'Savings Transfer'),
+    [categories]
+  );
+
+  const [editingWallet, setEditingWallet] = useState<{id: number, name: string, type: string, balance: number, currency: string} | null>(null);
+  const [editBalance, setEditBalance] = useState<number>(0);
+  const [editingCategory, setEditingCategory] = useState<{id: number, name: string, type?: string} | null>(null);
+  const [editingInlineCategory, setEditingInlineCategory] = useState<{id: number; name: string; budget: number} | null>(null);
+
+  const [newBudgetCategory, setNewBudgetCategory] = useState('');
+  const [newBudgetAmount, setNewBudgetAmount] = useState('');
+  const [budgetDialogOpen, setBudgetDialogOpen] = useState(false);
+  const [editingBudget, setEditingBudget] = useState<{id: number, category_name: string, limit_amount: number} | null>(null);
+  const [editingCategoryId, setEditingCategoryId] = useState<number | null>(null);
+  const [budgetInput, setBudgetInput] = useState<Record<string, string>>({});
+  const [expandedCategoryId, setExpandedCategoryId] = useState<number | null>(null);
+
+  const [weeklyReports, setWeeklyReports] = useState(() => {
+    return localStorage.getItem('clearsum_weekly_reports_enabled') === 'true';
+  });
+  const [showSummaryModal, setShowSummaryModal] = useState(false);
+  const [reportText, setReportText] = useState("");
+
+  const [isDirty, setIsDirty] = useState(false);
+  const [confirmDelete, setConfirmDelete] = useState<{ type: 'wallet' | 'budget' | 'reset'; id: number | null } | null>(null);
+  const [isModalOpen, setIsModalOpen] = useState(false);
+  const [selectedIcon, setSelectedIcon] = useState('🎯');
+  const [editingGoalId, setEditingGoalId] = useState<number | null>(null);
+  const [goalName, setGoalName] = useState('');
+  const [targetAmount, setTargetAmount] = useState('');
+  const [targetDate, setTargetDate] = useState('');
+  const [isAutoDepositToggledOn, setIsAutoDepositToggledOn] = useState(false);
+  const [goalAllocationRatio, setGoalAllocationRatio] = useState(0);
+  const [isDeleteOpen, setIsDeleteOpen] = useState(false);
+  const [targetGoalId, setTargetGoalId] = useState<number | null>(null);
+  const [pendingDeleteGoal, setPendingDeleteGoal] = useState<any>(null);
+  const [deletePreview, setDeletePreview] = useState<{ transfers: any[]; expenses: any[]; auditLogs: any[] } | null>(null);
+  const [deletePreviewLoading, setDeletePreviewLoading] = useState(false);
+  const [showDeleteDetails, setShowDeleteDetails] = useState(false);
+  const [formError, setFormError] = useState<string | null>(null);
+
+  const [restoreDialogOpen, setRestoreDialogOpen] = useState(false);
+  const [restoreFile, setRestoreFile] = useState<File | null>(null);
+
+  const handleEditClick = (goal: SavingsGoalDb) => {
+    const rawName = goal.name;
+    const matchedIcon = rawName.match(/^([\u2300-\u27BF]|[\uE000-\uF8FF]|\uD83C[\uDC00-\uDFFF]|\uD83D[\uDC00-\uDFFF]|[\u2011-\u26FF]|\uD83E[\uDC00-\uDFFF])/);
+    const icon = matchedIcon ? matchedIcon[1] : '🎯';
+    const name = rawName.replace(/^([\u2300-\u27BF]|[\uE000-\uF8FF]|\uD83C[\uDC00-\uDFFF]|\uD83D[\uDC00-\uDFFF]|[\u2011-\u26FF]|\uD83E[\uDC00-\uDFFF])\uFE0F?\s*/, '');
+    setSelectedIcon(icon);
+    setGoalName(name);
+    setTargetAmount(String((goal.target_amount || 0) / 100));
+    setTargetDate(goal.target_date ?? '');
+                    setIsAutoDepositToggledOn(goal.auto_deposit_surplus ?? false);
+                    setGoalAllocationRatio(goal.sweep_ratio ?? goal.allocation_ratio ?? 0);
+                    setEditingGoalId(goal.id ?? null);
+    setFormError(null);
+    setIsModalOpen(true);
+  };
+
+  const handleAddWallet = async () => {
+    if (!newWalletName || !newWalletType) {
+      toast.error('Please fill in wallet name and type');
+      return;
+    }
+    try {
+      const balance = newWalletBalance ? parseFloat(newWalletBalance) : 0;
+      await addWallet({ name: newWalletName, type: newWalletType, balance, currency: baseCurrency });
+      setNewWalletName('');
+      setNewWalletType('bank');
+      setNewWalletBalance('');
+      setNewWalletCurrency(baseCurrency as any || 'USD');
+      setWalletDialogOpen(false);
+      await fetchWallets();
+      toast.success('Wallet added successfully');
+    } catch {
+      toast.error('Failed to add wallet');
+    }
+  };
+
+  const handleDeleteWallet = async (id: number) => {
+    const wallet = wallets.find(w => w.id === id);
+    if (!wallet) return;
+    
+    if (wallet.balance > 0) {
+      toast.error('Cannot delete a wallet with an active balance. Please transfer your remaining funds to another account before removing this wallet.');
+      return;
+    }
+    
+    setConfirmDelete({ type: 'wallet', id });
+  };
+
+  const [goals, setGoals] = useState<any[]>([]);
+  const activeGoalsCount = goals ? goals.filter(g => (g.current_amount || 0) < (g.target_amount || 0)).length : 0;
+  const isMaxLimitReached = activeGoalsCount >= 5;
+  const fetchGoals = useCallback(async () => {
+    const data = await db.savings_goals.toArray();
+    setGoals(data);
+  }, []);
+
+  useEffect(() => {
+    fetchGoals();
+  }, [fetchGoals]);
+
+  const fetchWallets = useCallback(async () => {
+    const data = await db.wallets.toArray();
+    setWallets(data);
+  }, []);
+
+  const fetchCategories = useCallback(async () => {
+    const data = await db.categories.toArray();
+    setCategories(data);
+  }, []);
+
+  const fetchBudgets = useCallback(async () => {
+    const data = await db.budgets.toArray();
+    setBudgets(data);
+  }, []);
+
+  const fetchExpenses = useCallback(async () => {
+    const data = await db.expenses.toArray();
+    setExpenses(data);
+  }, []);
+
+  const fetchAll = useCallback(async () => {
+    await Promise.all([fetchWallets(), fetchCategories(), fetchBudgets(), fetchExpenses(), fetchGoals(), fetchCurrencies()]);
+  }, [fetchWallets, fetchCategories, fetchBudgets, fetchExpenses, fetchGoals, fetchCurrencies]);
+
+  useEffect(() => {
+    fetchAll();
+  }, [fetchAll]);
+
+  const editingInlineCategoryRef = useRef(editingInlineCategory);
+  editingInlineCategoryRef.current = editingInlineCategory;
+
+  const handleDeleteCategory = useCallback((id: number) => {
+    const cat = categories.find(c => c.id === id);
+    if (!cat) return;
+
+    const isParent = cat.parent_id == null;
+    const subCats = isParent ? categories.filter(c => c.parent_id === id) : [];
+    const allAffectedNames = isParent
+      ? [cat.name, ...subCats.map(s => s.name)]
+      : [cat.name];
+
+    const hasTransactions = expenses.some(e => allAffectedNames.includes(e.category) || (e.subcategory && allAffectedNames.includes(e.subcategory)));
+    const hasMainCategoryTransactions = isParent && expenses.some(e => allAffectedNames.includes(e.category));
+
+    if (hasTransactions) {
+      toast.error("Cannot delete category. There are active transactions assigned to it. Please remove or reassign those transactions first.");
+      return;
+    }
+
+    const allAffectedIds = [id, ...subCats.map(s => s.id!)];
+    const deletedCategories = [cat, ...subCats];
+
+    setCategories(prev => prev.filter(c => !allAffectedIds.includes(c.id!)));
+
+    const timeout = setTimeout(async () => {
+      try {
+        for (const c of deletedCategories) {
+          if (c.id) await deleteCategory(c.id);
+        }
+        await fetchCategories();
+      } catch {
+        setCategories(prev => {
+          const existingIds = new Set(prev.map(c => c.id));
+          const toRestore = deletedCategories.filter(c => !existingIds.has(c.id));
+          return [...prev, ...toRestore];
+        });
+        toast.error('Failed to delete category');
+      }
+    }, 5000);
+
+    toast.success(
+      <div className="flex items-center gap-2">
+        <span>Category removed.</span>
+        <button
+          className="text-blue-600 underline font-medium"
+          onClick={() => {
+            clearTimeout(timeout);
+            setCategories(prev => {
+              const existingIds = new Set(prev.map(c => c.id));
+              const toRestore = deletedCategories.filter(c => !existingIds.has(c.id));
+              return [...prev, ...toRestore];
+            });
+            toast.dismiss();
+          }}
+        >
+          Undo
+        </button>
+      </div>,
+      { duration: 5000 }
+    );
+  }, [categories, expenses, deleteCategory]);
+
+  const handleToggleCategory = useCallback((id: number) => {
+    setExpandedCategoryId(prev => prev === id ? null : id);
+  }, []);
+
+  const handleStartInlineEdit = useCallback((id: number) => {
+    const cat = categories.find(c => c.id === id);
+    if (!cat) return;
+    const b = budgets.find(b => b.category_name === cat.name);
+    setEditingInlineCategory({ id: cat.id!, name: cat.name, budget: b?.limit_amount ?? 0 });
+  }, [categories, budgets]);
+
+  const handleDeleteBudget = async (id: number) => {
+    setConfirmDelete({ type: 'budget', id });
+  };
+
+  const handleResetData = () => {
+    setConfirmDelete({ type: 'reset', id: null });
+  };
+
+  const handleRestoreDefaultCategories = async () => {
+    try {
+      await seedCategoriesOnly();
+      await fetchCategories();
+      toast.success('Default categories restored successfully');
+    } catch {
+      toast.error('Failed to restore default categories');
+    }
+  };
+
+  const executeDelete = async () => {
+    if (!confirmDelete) return;
+
+    const { type, id } = confirmDelete;
+
+    if (type === 'wallet' && id !== null) {
+      try {
+        await deleteWallet(id, (deletedWallet, undo) => {
+          toast.success(
+            <div className="flex items-center gap-2">
+              <span>Wallet removed.</span>
+              <button 
+                className="text-blue-600 underline font-medium"
+                onClick={() => {
+                  undo();
+                  toast.dismiss();
+                }}
+              >
+                Undo
+              </button>
+            </div>,
+            { duration: 5000 }
+          );
+        });
+        await fetchWallets();
+      } catch {
+        toast.error('Failed to delete wallet');
+      }
+    } else if (type === 'budget' && id !== null) {
+      try {
+        await deleteBudget(id);
+        await fetchBudgets();
+        toast.success('Budget deleted');
+      } catch {
+        toast.error('Failed to delete budget');
+      }
+    } else if (type === 'reset') {
+      await resetAllAppData();
+      localStorage.setItem('globalMasterValue', '0');
+      setMasterValve(0);
+    }
+
+    setConfirmDelete(null);
+  };
+
+  const handleAddCategory = async () => {
+    if (!newCategoryName) {
+      toast.error('Please enter category name');
+      return;
+    }
+    if (isSubcategory && !selectedParentId) {
+      toast.error('Please select a parent category');
+      return;
+    }
+    try {
+      if (isSubcategory) {
+        await addCategory(newCategoryName, newCategoryType, newCategoryIcon, selectedParentId);
+      } else {
+        const newParentId = await db.categories.add({
+          name: newCategoryName.trim(),
+          icon: newCategoryIcon,
+          type: newCategoryType,
+          parent_id: null,
+          created_at: new Date().toISOString()
+        });
+        for (const subName of tempSubs) {
+          await db.categories.add({
+            name: subName.trim(),
+            icon: newCategoryIcon,
+            type: newCategoryType,
+            parent_id: newParentId,
+            created_at: new Date().toISOString()
+          });
+        }
+      }
+      setNewCategoryName('');
+      setNewCategoryType('expense');
+      setNewCategoryIcon('HelpCircle');
+      setIsSubcategory(false);
+      setSelectedParentId(null);
+      setTempSubs([]);
+      setTempSubInput('');
+      setCategoryDialogOpen(false);
+      await fetchCategories();
+      toast.success(isSubcategory ? 'Subcategory added successfully' : 'Category added successfully');
+    } catch {
+      toast.error('Failed to add category');
+    }
+  };
+
+  const handleAddTempSub = () => {
+    const name = tempSubInput.trim();
+    if (!name) return;
+    if (tempSubs.some(s => s.toLowerCase() === name.toLowerCase())) {
+      toast.error('Subcategory already added');
+      return;
+    }
+    setTempSubs([...tempSubs, name]);
+    setTempSubInput('');
+  };
+
+  const handleRemoveTempSub = (index: number) => {
+    setTempSubs(tempSubs.filter((_, i) => i !== index));
+  };
+
+  const handleEditWalletClick = (wallet: any) => {
+    setEditingWallet({ id: wallet.id, name: wallet.name, type: wallet.type, balance: wallet.balance, currency: wallet.currency || baseCurrency });
+    setEditBalance(Number(wallet.balance || 0) / 100);
+  };
+
+  const handleUpdateWallet = async () => {
+    if (!editingWallet) return;
+    try {
+      const newBalanceCents = Math.round((Number(editBalance) || 0) * 100);
+      const currentBalanceCents = editingWallet.balance || 0;
+      const diffCents = newBalanceCents - currentBalanceCents;
+
+      await updateWallet(editingWallet.id, {
+        name: editingWallet.name,
+        type: editingWallet.type as any,
+        balance: newBalanceCents
+      });
+
+      if (diffCents !== 0) {
+        const displayDiffCents = Math.abs(diffCents);
+        const { id, ...cleanExpense } = {
+          description: 'Balance Adjustment',
+          amount: displayDiffCents,
+          category: 'Balance Adjustment',
+          subcategory: null,
+          date: toLocalDateString(),
+          receiptImage: null,
+          wallet_id: editingWallet.id,
+          type: 'transfer',
+          created_at: new Date().toISOString()
+        };
+        await db.expenses.add(cleanExpense);
+      }
+
+      setEditBalance(0);
+      setEditingWallet(null);
+      await fetchWallets();
+      toast.success('Wallet updated');
+    } catch {
+      toast.error('Failed to update wallet');
+    }
+  };
+
+  const handleUpdateCategory = async () => {
+    if (!editingCategory) return;
+    try {
+      await updateCategory(editingCategory.id, editingCategory.name, editingCategory.type as any);
+      const cat = categories.find(c => c.id === editingCategory.id);
+      if (cat && cat.parent_id != null) {
+        await db.budgets.where('category_name').equals(cat.name).delete();
+        await fetchBudgets();
+      }
+      setEditingCategory(null);
+      await fetchCategories();
+      toast.success('Category updated');
+    } catch {
+      toast.error('Failed to update category');
+    }
+  };
+
+  const handleAddBudget = async () => {
+    if (!newBudgetCategory || !newBudgetAmount) {
+      toast.error('Please fill in category and amount');
+      return;
+    }
+    try {
+      await addBudget(newBudgetCategory, Math.max(0, parseFloat(newBudgetAmount)));
+      setNewBudgetCategory('');
+      setNewBudgetAmount('');
+      setBudgetDialogOpen(false);
+      await fetchBudgets();
+      toast.success('Budget added successfully');
+    } catch {
+      toast.error('Failed to add budget');
+    }
+  };
+
+  const handleUpdateBudget = async () => {
+    if (!editingBudget) return;
+    try {
+      await updateBudget(editingBudget.id, Math.max(0, editingBudget.limit_amount));
+      setEditingBudget(null);
+      await fetchBudgets();
+      toast.success('Budget updated');
+    } catch {
+      toast.error('Failed to update budget');
+    }
+  };
+
+  const handleSaveBudgetInline = useCallback(async (categoryName: string, amount: string) => {
+    const cat = categories.find(c => c.name === categoryName);
+    if (String(cat?.type).toLowerCase() === 'income') {
+      toast.error('Budgets cannot be set on income categories');
+      return;
+    }
+    const numAmount = parseFloat(amount);
+    if (!amount || isNaN(numAmount) || numAmount <= 0) {
+      try {
+        await db.budgets.where('category_name').equals(categoryName).delete();
+        await fetchBudgets();
+        toast.success('Budget limit removed');
+      } catch {
+        toast.error('Failed to remove budget');
+      }
+      setBudgetInput(prev => ({ ...prev, [categoryName]: '' }));
+      setEditingCategoryId(null);
+      return;
+    }
+    try {
+      const clampedAmount = Math.max(0, numAmount);
+      const existing = budgets.find(b => b.category_name === categoryName);
+      if (existing) {
+        await updateBudget(existing.id, clampedAmount);
+        toast.success('Budget updated');
+      } else {
+        await addBudget(categoryName, clampedAmount);
+        toast.success('Budget set');
+      }
+      await fetchBudgets();
+      setBudgetInput(prev => ({ ...prev, [categoryName]: '' }));
+      setEditingCategoryId(null);
+    } catch {
+      toast.error('Failed to save budget');
+    }
+  }, [categories, budgets, updateBudget, addBudget, db, fetchBudgets]);
+
+  const handleSaveInlineEdit = useCallback(async (id: number) => {
+    const edit = editingInlineCategoryRef.current;
+    if (!edit || edit.id !== id) return;
+    const cat = categories.find(c => c.id === id);
+    if (!cat) return;
+    await updateCategory(edit.id, edit.name, cat.type as any);
+    const amt = String(edit.budget);
+    if (amt && parseFloat(amt) > 0) {
+      await handleSaveBudgetInline(cat.name, amt);
+    } else {
+      await db.budgets.where('category_name').equals(cat.name).delete();
+      await fetchBudgets();
+    }
+    await fetchCategories();
+    setEditingInlineCategory(null);
+  }, [updateCategory, categories, handleSaveBudgetInline, db, fetchBudgets, fetchCategories]);
+
+  const handleCancelInlineEdit = useCallback(() => {
+    setEditingInlineCategory(null);
+  }, []);
+
+  const handleEditingNameChange = useCallback((id: number, name: string) => {
+    setEditingInlineCategory(prev => prev?.id === id ? { ...prev, name } : prev);
+  }, []);
+
+  const handleEditingBudgetChange = useCallback((id: number, budget: number) => {
+    setEditingInlineCategory(prev => prev?.id === id ? { ...prev, budget } : prev);
+  }, []);
+
+  const handleEditSubcategory = useCallback((sub: Category) => {
+    setEditingCategory({ id: sub.id!, name: sub.name, type: sub.type });
+  }, []);
+
+  const handleManualSweepButtonClick = async () => {
+    try {
+    if (!localFrequency) {
+      toast.error('Select a sweep frequency (Daily, Weekly, or Monthly) before running a manual sweep.');
+      return;
+    }
+    const todayStr = new Date().toLocaleDateString('en-CA');
+
+    const settings = await db.settings.get(1);
+    if (!settings) {
+      toast.error('Save guardrail settings first before running a manual sweep.');
+      return;
+    }
+
+    const activeFreq = localFrequency as 'daily' | 'weekly' | 'monthly';
+    if (activeFreq !== 'daily' && activeFreq !== 'weekly' && activeFreq !== 'monthly') return;
+
+    const activeGoals = await db.savings_goals.toArray();
+    const hasAutoDepositGoals = activeGoals.some(g => g.auto_deposit_surplus === true);
+
+    if (!hasAutoDepositGoals) {
+      toast.error('No goals with auto-deposit surplus enabled found.');
+      return;
+    }
+
+    const sourceWalletId = wallets[0]?.id;
+    if (!sourceWalletId) {
+      toast.error('No source wallet found.');
+      return;
+    }
+
+    const sourceWallet = wallets.find(w => w.id === sourceWalletId);
+
+    const livePoolCents = wallets.reduce((sum, w) => sum + (w.balance || 0), 0);
+
+    const trueLiveSurplusCents = Math.max(0, livePoolCents - lockedSavings - safetyFloor);
+
+    let rawSurplusCents = 0;
+    if (trueLiveSurplusCents > 0) {
+      rawSurplusCents = trueLiveSurplusCents;
+    } else if (hasAutoDepositGoals) {
+      rawSurplusCents = Math.max(0, livePoolCents - lockedSavings - safetyFloor);
+    }
+
+    if (rawSurplusCents <= 0) {
+      toast.error('No surplus available for sweep.');
+      return;
+    }
+
+    const totalSavingsBudget = Math.floor((rawSurplusCents * masterValve) / 100);
+    if (totalSavingsBudget <= 0) {
+      toast.error('Master valve set to 0. Increase global master sweep percentage.');
+      return;
+    }
+
+    // Fetch today's existing sweep transaction rows
+    const todayTransactions = await db.expenses
+      .filter(e => e.date === todayStr && e.category === 'System Transfer')
+      .toArray();
+
+    const eligibleGoals = activeGoals.filter(g => g.auto_deposit_surplus === true);
+
+    if (eligibleGoals.length === 0) {
+      toast.error('No eligible goals found with auto-deposit enabled.');
+      return;
+    }
+
+    let totalAllocated = 0;
+    const allocatedGoalNames: string[] = [];
+
+    await db.transaction('rw', [db.savings_goals, db.wallets, db.expenses, db.settings], async () => {
+      for (const goal of eligibleGoals) {
+        // Skip if this goal already received a sweep today
+        const alreadySweptToday = todayTransactions.some(t =>
+          t.description?.toUpperCase().includes(goal.name.toUpperCase())
+        );
+        if (alreadySweptToday) continue;
+
+        const goalRatio = goal.sweep_ratio ?? goal.allocation_ratio ?? 0;
+        if (goalRatio <= 0) continue;
+
+        let goalAllocation = Math.floor(totalSavingsBudget * (goalRatio / 100));
+
+        // Cap-clip to remaining target room
+        const remainingRoom = Math.max(0, (goal.target_amount || 0) - (goal.current_amount || 0));
+        if (goalAllocation > remainingRoom) {
+          goalAllocation = remainingRoom;
+        }
+
+        if (goalAllocation <= 0) continue;
+
+        // Deduct from wallet
+        const currentWallet = await db.wallets.get(sourceWalletId);
+        if (currentWallet) {
+          await db.wallets.update(sourceWalletId, {
+            balance: Math.max(0, (currentWallet.balance || 0) - goalAllocation)
+          });
+        }
+
+        // Update goal progress
+        await db.savings_goals.update(goal.id!, {
+          current_amount: Math.max(0, (goal.current_amount || 0) + goalAllocation),
+        });
+
+        // Write the System Transfer ledger row
+        await db.expenses.add({
+          wallet_id: sourceWalletId,
+          amount: goalAllocation,
+          category: 'System Transfer',
+          subcategory: 'Vault Allocation',
+          type: 'transfer',
+          date: todayStr,
+          description: `${activeFreq.charAt(0).toUpperCase() + activeFreq.slice(1)} Auto-sweep allocation to ${goal.name} (${goalRatio}%)`,
+          created_at: new Date().toISOString()
+        });
+
+        totalAllocated += goalAllocation;
+        allocatedGoalNames.push(goal.name);
+      }
+    });
+
+    if (totalAllocated <= 0) {
+      toast.info('All eligible goals already received their sweep today.');
+      return;
+    }
+
+    // Update ledger timestamp
+    let ledger: Record<string, string> = {};
+    try {
+      if (settings.last_processed_sweep?.startsWith('{')) {
+        ledger = JSON.parse(settings.last_processed_sweep);
+      } else if (settings.last_processed_sweep) {
+        ledger = { [settings.last_sweep_frequency || 'daily']: settings.last_processed_sweep };
+      }
+    } catch {
+      ledger = {};
+    }
+    ledger[activeFreq] = todayStr;
+
+    await db.settings.put({
+      id: 1,
+      ...settings,
+      last_processed_sweep: JSON.stringify(ledger),
+      last_sweep_frequency: activeFreq
+    });
+
+    await fetchGoals();
+    await fetchWallets();
+    await fetchExpenses();
+    toast.success(`Sweep completed: ${formatMoney(totalAllocated, baseCurrency)} allocated to ${allocatedGoalNames.join(', ')}`);
+    } catch (e) { console.error('Manual sweep failed:', e); toast.error('Manual sweep failed. Check console.'); }
+  };
+
+  const handleSave = () => {
+    toast.success('Settings saved successfully');
+  };
+
+  const handleBackupDatabase = async () => {
+    try {
+      console.log("Compiling full database storage snapshot...");
+      const blob = await exportDB(db, { pretty: true, format: 'json' });
+      const url = URL.createObjectURL(blob);
+      const link = document.createElement("a");
+      link.href = url;
+      link.download = `ExpenseApp_Master_Backup_${new Date().toISOString().split("T")[0]}.json`;
+      document.body.appendChild(link);
+      link.click();
+      document.body.removeChild(link);
+      URL.revokeObjectURL(url);
+      toast.success('Database backup downloaded successfully');
+    } catch (error) {
+      console.error("Critical failure during full DB backup write:", error);
+      toast.error('Failed to create backup');
+    }
+  };
+
+  const handleWeeklyToggleChange = (checked: boolean) => {
+    setWeeklyReports(checked);
+    localStorage.setItem('clearsum_weekly_reports_enabled', checked ? 'true' : 'false');
+    console.log(`Weekly Reports preference updated and saved on disk: ${checked}`);
+  };
+
+  const handleGenerateWeeklySnapshot = async () => {
+    if (!weeklyReports) {
+      toast.error('Please enable the Weekly Reports toggle first.');
+      return;
+    }
+
+    try {
+      // 1. Fetch real-time data logs from local Dexie database
+      const wallets = await db.wallets.toArray();
+      const expenses = await db.expenses.toArray();
+      const categories = await db.categories.toArray();
+      const budgets = await db.budgets.toArray(); // fetch budgets too
+
+// Calculate current localized financial metrics
+       const totalNetWorth = sumMoney(wallets.map(w => Number(w.balance) || 0));
+       const currencySymbol = CURRENCY_SYMBOLS[baseCurrency] || "₨";
+
+      // 2. Draft a beautiful text report layout structure
+      let reportContent = `==================================================\n`;
+      reportContent += `       CLEARSUM: PERSONAL FINANCE TRACKER DESKTOP APP FOR WINDOWS       \n`;
+      reportContent += `       Generated: ${new Date().toLocaleDateString()} \n`;
+      reportContent += `==================================================\n\n`;
+
+      reportContent += `💰 NET WORTH SUMMARY:\n`;
+      reportContent += `--------------------------------------------------\n`;
+      reportContent += `Total Current Wealth: ${formatMoney(totalNetWorth, baseCurrency)}\n\n`;
+
+      reportContent += `🏦 ACCOUNTS & WALLETS REGISTRY:\n`;
+      reportContent += `--------------------------------------------------\n`;
+      wallets.forEach(w => {
+        const walletCurrency = w.currency || baseCurrency; 
+        const walletBalance = Number(w.balance) || 0;
+        
+        reportContent += `- ${w.name} (${w.type}): ${formatMoney(walletBalance, baseCurrency)}\n`;
+      });
+      reportContent += `\n`;
+
+      reportContent += `📊 TRANSACTIONAL PERFORMANCE LOGS\n`;
+      reportContent += `------------------------------------------------------------------------\n`;
+      reportContent += `Total Records Tracked: ${expenses.length} items\n\n`;
+      reportContent += `Latest Expenses Logged (Past 7 Days):\n`;
+
+      const latestExpenses = [...expenses]
+        .sort((a, b) => {
+          const timeA = a.date ? new Date(a.date).getTime() : 0;
+          const timeB = b.date ? new Date(b.date).getTime() : 0;
+          if (timeB !== timeA) return timeB - timeA;
+          return (Number(b.id) || 0) - (Number(a.id) || 0);
+        })
+        .slice(0, 7); // EXPANDED: Pull the top 7 absolute newest items for a full week log
+
+      latestExpenses.forEach(e => {
+        // 1. Correctly resolve the exact wallet details to determine the true currency
+        const matchingWallet = wallets.find(w => w.name === e.wallet || w.id === e.wallet_id);
+        const rawCurrency = e.currency || (matchingWallet ? matchingWallet.currency : baseCurrency);
+        const txDisplaySymbol = CURRENCY_SYMBOLS[rawCurrency] || rawCurrency;
+        const txCurrLabel = rawCurrency;
+        
+        // 3. Format the raw number with clean thousands separator commas
+        const txAmountFormatted = Number(e.amount || 0).toLocaleString(undefined, { 
+          minimumFractionDigits: 2, 
+          maximumFractionDigits: 2 
+        });
+        
+        // 4. Construct the clean text label (Ensure NO hardcoded '₨' sits in this template)
+        const txLabel = `${txDisplaySymbol}${txAmountFormatted}`.padEnd(14);
+        const txCat = e.category.padEnd(18);
+        
+        // Build the final synchronized text summary line
+        reportContent += `  * ${e.date} | ${txCat} | ${txLabel} (${txCurrLabel})\n`;
+      });
+      reportContent += `\n`;
+
+      // NEW: Category Budget & Performance Breakdown
+      reportContent += `\n📊 CATEGORY BUDGET & PERFORMANCE BREAKDOWN:\n`;
+      reportContent += `--------------------------------------------------\n`;
+
+      for (const cat of categories) {
+        const catExpenses = expenses.filter(e => e.category === cat.name);
+        const totalSpent = sumMoney(catExpenses.map(e => Number(e.amount) || 0));
+        const budgetObj = budgets.find(b => b.category_name === cat.name);
+        const budgetLimit = budgetObj ? Number(budgetObj.limit_amount) : 0;  // correct field name
+
+        reportContent += `* ${cat.name}:\n`;
+        reportContent += `  Spent: ${formatMoney(totalSpent, baseCurrency)}\n`;
+        if (budgetLimit > 0) {
+          const status = totalSpent > budgetLimit ? "⚠️ OVER BUDGET" : "✅ WITHIN BUDGET";
+          reportContent += `  Limit: ${formatMoney(budgetLimit, baseCurrency)} (${status})\n`;
+        } else {
+          reportContent += `  Limit: No Budget Target Configured\n`;
+        }
+      }
+
+      // APPENDIX: Audit Logs (Voided & Deleted)
+      const allAuditLogsReport = await db.auditLogs.toArray();
+      const OPERATIONAL_REASONS_REPORT = ['Manual sweep execution', 'Auto-sweep engine execution', 'Goal cap repair on init', 'Goal completion — marked as spent', 'User-initiated goal fund reallocation'];
+      const filteredAuditLogsReport = allAuditLogsReport.filter(log => !OPERATIONAL_REASONS_REPORT.includes(log.reason || ''));
+      if (filteredAuditLogsReport.length > 0) {
+        reportContent += `\n📋 APPENDIX: AUDIT LOGS — VOIDED AND DELETED TRANSACTIONS\n`;
+        reportContent += `--------------------------------------------------\n`;
+        [...filteredAuditLogsReport]
+          .sort((a, b) => new Date(b.date).getTime() - new Date(a.date).getTime())
+          .slice(0, 50)
+          .forEach(log => {
+            const amt = formatMoney(Math.abs(Number(log.original_amount || 0)), baseCurrency);
+            reportContent += `  ${new Date(log.date).toLocaleDateString()} | ${(log.original_description || '—').padEnd(30)} | ${amt.padEnd(14)} | ${log.reason || '—'}\n`;
+          });
+        reportContent += `\n`;
+      }
+
+      reportContent += `\n==================================================\n`;
+      reportContent += `🔒 Privacy Note: Securely compiled 100% locally on device.\n`;
+      reportContent += `==================================================\n`;
+
+      // 3. Store report and open preview modal instead of direct download
+      setReportText(reportContent);
+      setShowSummaryModal(true);
+
+      console.log("Weekly financial summary preview opened.");
+    } catch (error) {
+      console.error("Critical failure during weekly report compile:", error);
+      toast.error("Failed to generate weekly summary.");
+    }
+  };
+
+  const handleExportTimelinePDF = async (timeline: 'weekly' | 'monthly') => {
+    try {
+      const isAppDarkMode = document.documentElement.classList.contains('dark');
+      const wallets = await db.wallets.toArray();
+      const expenses = await db.expenses.toArray();
+      const budgets = await db.budgets.toArray();
+      const allAuditLogs = await db.auditLogs.toArray();
+      const baseCurrencySymbol = CURRENCY_SYMBOLS[baseCurrency] || '₨';
+      const reportFxRate = (exchangeRates || DEFAULT_EXCHANGE_RATES)[baseCurrency] || 1;
+
+      const formatToTwoDecimals = formatMoney;
+
+      const fmt = (amount: number) => formatMoney(amount, baseCurrency);
+
+      const dayRange = timeline === 'weekly' ? 7 : 30;
+      const today = new Date();
+      today.setHours(0, 0, 0, 0);
+
+      const past7DaysDate = new Date();
+      past7DaysDate.setDate(today.getDate() - 7);
+      past7DaysDate.setHours(0, 0, 0, 0);
+
+      const relevantExpenses = timeline === 'weekly'
+        ? expenses.filter(e => {
+            if (!e.date) return false;
+            const txDate = new Date(e.date);
+            txDate.setHours(0, 0, 0, 0);
+            return txDate >= past7DaysDate && txDate <= today;
+          })
+        : expenses.filter(e => {
+            if (!e.date) return false;
+            const threshold = today.getTime() - (dayRange * 24 * 60 * 60 * 1000);
+            return new Date(e.date).getTime() >= threshold;
+          });
+const totalSpent = sumMoney(relevantExpenses.filter(e => String(e.type).toLowerCase() !== 'income').map(e => Number(e.amount) || 0));
+        const totalIncome = sumMoney(relevantExpenses.filter(e => String(e.type).toLowerCase() === 'income').map(e => Number(e.amount) || 0));
+
+      // Show entries that represent voided / deleted transactions.
+      // Exclude known operational entries (sweeps, repairs, etc.).
+      const OPERATIONAL_REASONS = ['Manual sweep execution', 'Auto-sweep engine execution', 'Goal cap repair on init', 'Goal completion — marked as spent', 'User-initiated goal fund reallocation'];
+      const filteredAuditLogs = allAuditLogs.filter(log => {
+        if (OPERATIONAL_REASONS.includes(log.reason || '')) return false;
+        const logDate = new Date(log.date);
+        if (timeline === 'weekly') {
+          const sevenDaysAgo = new Date(today.getTime() - 7 * 24 * 60 * 60 * 1000);
+          return logDate >= sevenDaysAgo;
+        } else {
+          const thresholdDate = new Date();
+          thresholdDate.setDate(thresholdDate.getDate() - 30);
+          return logDate >= thresholdDate;
+        }
+      });
+
+      // Print-only filter: for goal-deletion entries, strictly permit ONLY
+      // the primary entry categorized as 'Savings Refund'. Sibling technical
+      // tracking lines (Transfer: / Savings Transfer) are skipped from print.
+      const dedupedAuditLogs = filteredAuditLogs.filter(log => {
+        if ((log.original_description || '').includes('Goal deleted')) {
+          return log.original_category === 'Savings Refund';
+        }
+        return true;
+      });
+
+      const walletMap = new Map(wallets.map(w => [w.id, w.name]));
+
+      const windowName = `clearsum-report-${new Date().getTime()}`;
+      const printWindow = window.open('', windowName);
+      if (!printWindow) return;
+
+      printWindow.document.write(`
+        <html>
+          <head>
+            <title>ClearSum Financial Statement - ${timeline.toUpperCase()} REPORT</title>
+            <meta http-equiv="Cache-Control" content="no-cache, no-store, must-revalidate" />
+            <meta http-equiv="Pragma" content="no-cache" />
+            <meta http-equiv="Expires" content="0" />
+            <style>
+  /* BASE RESETS */
+  body { 
+    font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, sans-serif; 
+    padding: 0; 
+    margin: 0; 
+    line-height: 1.5; 
+    transition: background-color 0.2s, color 0.2s;
+  }
+
+  /* --- SCREEN STATE 1: APP IS IN DARK MODE --- */
+  body.dark-theme { background-color: #09090b; color: #f4f4f5; }
+  body.dark-theme .toolbar { background: #18181b; border-bottom: 1px solid #27272a; }
+  body.dark-theme .toolbar-btn.secondary { background: #27272a; color: #a1a1aa; border: 1px solid #3f3f46; }
+  body.dark-theme .page-container { background: #18181b; border: 1px solid #27272a; box-shadow: 0 10px 25px -5px rgba(0, 0, 0, 0.4); }
+  body.dark-theme .title, body.dark-theme .section-title { color: #60a5fa; }
+  body.dark-theme .subtitle { color: #a1a1aa; }
+  body.dark-theme .section-title { border-bottom: 2px solid #27272a; }
+  body.dark-theme .kpi-card { background: rgba(39,39,42,0.4); border: 1px solid #27272a; }
+  body.dark-theme .kpi-title { color: #a1a1aa; }
+  body.dark-theme .kpi-val { color: #f4f4f5; }
+  body.dark-theme th { background: rgba(39,39,42,0.6); color: #a1a1aa; border-bottom: 2px solid #27272a; }
+  body.dark-theme td { border-bottom: 1px solid rgba(39,39,42,0.6); color: #e4e4e7; }
+  body.dark-theme .line-through { text-decoration: line-through; color: #a1a1aa !important; }
+  body.dark-theme .badge-crit { background: #581c1c; color: #fca5a5; }
+  body.dark-theme .badge-safe { background: #064e3b; color: #6ee7b7; }
+  body.dark-theme .audit-header { background-color: #1e293b; color: #cbd5e1; font-weight: 600; border-bottom: 2px solid #334155; }
+  body.dark-theme .audit-amount { color: #d4d4d8; text-decoration: line-through; font-family: 'Courier New', monospace; font-weight: 700; font-size: 13px; text-align: right; }
+  body.dark-theme .voided-section-title { color: #ef4444; font-size: 13px; display: flex; align-items: center; gap: 8px; margin-top: 32px; border: none; }
+  /* PREMIUM FIXED: Brightened dull currency text to high-contrast crisp blue */
+  body.dark-theme .amount-val { color: #60a5fa !important; }
+
+  /* --- SCREEN STATE 2: APP IS IN LIGHT MODE --- */
+  body.light-theme { background-color: #f9fafb; color: #111827; }
+  body.light-theme .toolbar { background: #ffffff; border-bottom: 1px solid #e5e7eb; box-shadow: 0 1px 3px rgba(0,0,0,0.05); }
+  body.light-theme .toolbar-btn.secondary { background: #f3f4f6; color: #4b5563; border: 1px solid #d1d5db; }
+  body.light-theme .page-container { background: #ffffff; border: 1px solid #e5e7eb; box-shadow: 0 4px 10px rgba(0,0,0,0.03); }
+  body.light-theme .title, body.light-theme .section-title { color: #1e3a8a; }
+  body.light-theme .subtitle { color: #4b5563; }
+  body.light-theme .section-title { border-bottom: 2px solid #e5e7eb; }
+  body.light-theme .kpi-card { background: #f9fafb; border: 1px solid #e5e7eb; }
+  body.light-theme .kpi-title { color: #4b5563; }
+  body.light-theme .kpi-val { color: #111827; }
+  body.light-theme th { background: #f3f4f6; color: #4b5563; border-bottom: 2px solid #e5e7eb; }
+  body.light-theme td { border-bottom: 1px solid #edf2f7; color: #374151; }
+  body.light-theme .line-through { text-decoration: line-through; color: #9ca3af !important; }
+  body.light-theme .badge-crit { background: #fee2e2; color: #991b1b; }
+  body.light-theme .badge-safe { background: #d1fae5; color: #065f46; }
+  body.light-theme .audit-header { background-color: #f1f5f9; color: #334155; font-weight: 600; border-bottom: 2px solid #e2e8f0; }
+  body.light-theme .audit-amount { color: #262626; text-decoration: line-through; font-family: 'Courier New', monospace; font-weight: 700; font-size: 13px; text-align: right; }
+  body.light-theme .amount-val { color: #1e40af !important; }
+  body.light-theme .voided-section-title { color: #dc2626; font-size: 13px; display: flex; align-items: center; gap: 8px; margin-top: 32px; border: none; }
+
+  /* GLOBAL LAYOUT STYLES */
+  .table-fixed { table-layout: fixed; }
+  .w-full { width: 100%; }
+  .text-left { text-align: left; }
+  .border-collapse { border-collapse: collapse; }
+  .toolbar { position: fixed; top: 0; left: 0; right: 0; z-index: 50; background: rgba(250,250,250,0.9); backdrop-filter: blur(12px); border-bottom: 1px solid rgba(228,228,231,0.8); padding: 12px 16px; display: flex; align-items: center; justify-content: center; gap: 15px; }
+  .toolbar-btn { background: #2563eb; color: white; border: 0; font-size: 12px; font-weight: 600; padding: 8px 16px; border-radius: 6px; cursor: pointer; transition: background 0.2s; }
+  .toolbar-btn:hover { background: #1d4ed8; }
+  body.dark-theme .toolbar { background: rgba(24,24,27,0.9); border-bottom: 1px solid rgba(39,39,42,0.8); }
+  .page-container { width: 100%; max-width: 1280px; margin: 0 auto; background: #ffffff; border: 1px solid rgba(228,228,231,0.6); border-radius: 16px; padding: 24px; box-shadow: 0 25px 50px -12px rgba(0,0,0,0.25); box-sizing: border-box; }
+  body.dark-theme .page-container { background: #18181b; border: 1px solid rgba(39,39,42,0.6); }
+  .header { border-bottom: 2px solid #3b82f6; padding-bottom: 15px; margin-bottom: 30px; }
+  .title { font-size: 24px; font-weight: 800; margin: 0; text-transform: uppercase; letter-spacing: 0.5px; color: #1A363A; }
+  .subtitle { font-size: 12px; margin-top: 6px; font-weight: 500; }
+  body.dark-theme .title { color: #60a5fa; }
+  body.dark-theme .subtitle { color: #a1a1aa; }
+  .section-title { font-size: 13px; font-weight: 700; text-transform: uppercase; padding-bottom: 6px; margin: 30px 0 15px 0; letter-spacing: 0.5px; }
+  .kpi-grid { display: flex; gap: 20px; margin-bottom: 25px; }
+  .kpi-card { flex: 1; padding: 16px; border-radius: 8px; }
+  .kpi-title { font-size: 11px; font-weight: 600; text-transform: uppercase; }
+  .kpi-val { font-size: 20px; font-weight: 800; margin-top: 4px; }
+  table { width: 100%; border-collapse: collapse; margin-top: 10px; font-size: 13px; table-layout: auto; }
+  th { font-weight: 700; text-transform: uppercase; font-size: 11px; padding: 10px 12px; }
+  td { padding: 12px 12px; white-space: normal; word-break: break-word; line-height: 1.4; }
+  .badge { padding: 3px 8px; font-size: 10px; font-weight: 700; border-radius: 4px; }
+
+  /* AUTOMATIC SMART PRINT INVERSION (Always White on Paper for Ink Saving) */
+  @media print {
+    @page { size: portrait; margin: 1.5cm 1.2cm 1.5cm 1.2cm; }
+    body { background: #ffffff !important; color: #000000 !important; padding: 0 !important; margin: 0 !important; font-size: 11px !important; }
+    .toolbar { display: none !important; }
+    .page-container { margin: 0 !important; padding: 0 !important; box-shadow: none !important; border: 0 !important; width: 100% !important; max-width: 100% !important; background: transparent !important; }
+    .title, .section-title { color: #1e3a8a !important; }
+    .subtitle { color: #4b5563 !important; }
+    .kpi-card { background: #f9fafb !important; border: 1px solid #e5e7eb !important; }
+    .kpi-val { color: #1e3a8a !important; }
+    .kpi-title { color: #4b5563 !important; }
+    th { background: #f3f4f6 !important; color: #4b5563 !important; border-bottom: 2px solid #e5e7eb !important; }
+    td { border-bottom: 1px solid #e5e7eb !important; color: #111111 !important; padding: 8px 6px !important; font-size: 11px !important; }
+    .badge-crit { background: #fee2e2 !important; color: #991b1b !important; }
+    .badge-safe { background: #d1fae5 !important; color: #065f46 !important; }
+    .amount-val { color: #1e3a8a !important; }
+    .print-expand-container { max-height: none !important; overflow: visible !important; height: auto !important; }
+  }
+              /* PRINT OVERRIDES — amount right-padding expands to pr-12 (48px) */
+      @media print {
+        th.amount-header, td.audit-amount, td.amount-cell { padding-right: 40px !important; }
+      }
+    </style>
+          </head>
+          <body class="${isAppDarkMode ? 'dark-theme' : 'light-theme'}">
+            <div class="toolbar">
+              <button class="toolbar-btn" onclick="window.print()">🖨️ Print / Save as PDF</button>
+              <button class="toolbar-btn secondary" onclick="window.close()">✕ Close Preview</button>
+            </div>
+
+            <div style="width:100%;height:22px;margin-top:22px;clear:both;display:block;"></div>
+
+            <div class="page-container">
+              <div class="header">
+                <h1 class="title" style="color: #1A363A; font-weight: 800;">CLEARSUM FINANCIAL STATEMENT</h1>
+                <div class="subtitle">Private Offline Ledger Summary • Generated on ${new Date().toLocaleDateString()} • Timeline: Past ${dayRange} Days</div>
+              </div>
+
+              <div class="kpi-grid">
+                <div class="kpi-card"><div class="kpi-title">Consolidated Balance</div><div class="kpi-val">${formatMoney(sumMoney(wallets.map(w => Number(w.balance || 0))), baseCurrency)}</div></div>
+                <div class="kpi-card"><div class="kpi-title">Total Expenses</div><div class="kpi-val">${fmt(totalSpent)}</div></div>
+                <div class="kpi-card"><div class="kpi-title">Total Income</div><div class="kpi-val">${fmt(totalIncome)}</div></div>
+                <div class="kpi-card"><div class="kpi-title">Active Accounts</div><div class="kpi-val">${wallets.length} Wallets</div></div>
+              </div>
+
+              <div class="section-title">🛡️ Monthly Budget Breakdown Performance</div>
+              <table>
+                <thead>
+                  <tr>
+                    <th style="width: 30%; text-align: left;">Category Name</th>
+                    <th style="width: 25%; text-align: left;">Total Spent In Period</th>
+                    <th style="width: 25%; text-align: left;">Configured Limit</th>
+                    <th style="width: 20%; text-align: right;">Status Alert</th>
+                  </tr>
+                </thead>
+                <tbody>
+                  ${budgets.map(b => {
+                    const bExpenses = relevantExpenses.filter(e => e.type !== 'income' && e.category === b.category_name);
+                    const bSpent = sumMoney(bExpenses.map(e => Number(e.amount) || 0));
+                    const limit = Number(b.limit_amount) || 0;
+                    const isOver = bSpent > limit && limit > 0;
+                    return `
+                      <tr>
+                        <td style="width: 30%; text-align: left; font-weight: 600;">${b.category_name}</td>
+                        <td style="width: 25%; text-align: left;">${fmt(bSpent)}</td>
+                        <td style="width: 25%; text-align: left;">${limit > 0 ? fmt(limit) : 'No Target Set'}</td>
+                        <td style="width: 20%; text-align: right;">
+                          ${limit > 0 ? (isOver ? '<span class="badge badge-crit">⚠️ OVER BUDGET</span>' : '<span class="badge badge-safe">✅ WITHIN BUDGET</span>') : '—'}
+                        </td>
+                      </tr>
+                    `;
+                  }).join('')}
+                </tbody>
+              </table>
+
+              <div class="section-title">📊 Historical Recent Activity Log</div>
+              <div class="print-expand-container" style="overflow-x: auto; max-height: 350px; overflow-y: auto; padding-right: 4px; scrollbar-width: thin;">
+                <table class="w-full text-left border-collapse table-fixed" style="min-width: 700px;">
+                  <thead>
+                    <tr>
+                      <th style="width: 12%; text-align: left; padding-left: 16px;">DATE</th>
+                      <th style="width: 20%; text-align: left;">DESCRIPTION</th>
+                      <th style="width: 28%; text-align: left;">CATEGORY & SUBCATEGORY</th>
+                      <th style="width: 15%; text-align: left;">ACCOUNT / WALLET</th>
+                      <th style="width: 13%; text-align: left;">TRANSACTION TYPE</th>
+                      <th style="width: 12%; text-align: right; padding-right: 32px;" class="amount-header">AMOUNT</th>
+                    </tr>
+                  </thead>
+                  <tbody>
+                    ${[...relevantExpenses]
+                      .sort((a, b) => (b.date || '').localeCompare(a.date || '') || (Number(b.id) || 0) - (Number(a.id) || 0))
+                      .slice(0, 100).map(e => {
+                      const linkedWallet = wallets.find(w => w.id === e.wallet_id || w.name === e.wallet);
+                      const displayWalletName = linkedWallet ? linkedWallet.name : 'Unknown';
+                      const isIncome = String(e.type).toLowerCase() === 'income';
+                      const sign = isIncome ? '+' : '-';
+                      const color = isIncome ? '#22c55e' : '#ef4444';
+                      const isBalanceAdjustment = e.category === 'Balance Adjustment';
+                      const isTransfer = e.category === 'Savings Transfer' || String(e.type).toLowerCase() === 'transfer';
+                      const typeLabel = isIncome ? 'Income' : isBalanceAdjustment ? 'Balance Adjustment' : isTransfer ? 'Savings Transfer' : 'Expense';
+                      return `
+                        <tr>
+                          <td style="width: 12%; text-align: left; padding-left: 16px;">${e.date}</td>
+                          <td style="width: 20%; text-align: left;" title="${e.description}">${e.description}</td>
+                          <td style="width: 28%; text-align: left;">${e.category}${e.subcategory ? ` • ${e.subcategory}` : ''}</td>
+                          <td style="width: 15%; text-align: left;">${displayWalletName}</td>
+                          <td style="width: 13%; text-align: left;"><span style="color: #a1a1aa;">${typeLabel}</span></td>
+                          <td style="width: 12%; text-align: right; padding-right: 32px; font-weight: 700; color: ${color};" class="amount-cell">${isIncome ? '+' : ''}${fmt(Number(e.amount || 0))}</td>
+                        </tr>
+                      `;
+                    }).join('')}
+                  </tbody>
+                </table>
+              </div>
+
+              ${dedupedAuditLogs.length > 0 ? `
+               <div class="section-title voided-section-title">📋 APPENDIX: AUDIT LOGS — VOIDED AND DELETED TRANSACTIONS</div>
+               <div class="print-expand-container" style="overflow-x: auto; max-height: 350px; overflow-y: auto; padding-right: 4px; scrollbar-width: thin;">
+                 <table class="w-full text-left border-collapse table-fixed" style="min-width: 700px;">
+                   <thead>
+                     <tr class="audit-header">
+                       <th class="audit-header" style="width: 12%; text-align: left; padding-left: 16px;">DATE</th>
+                       <th class="audit-header" style="width: 20%; text-align: left;">DESCRIPTION</th>
+                       <th class="audit-header" style="width: 28%; text-align: left;">CATEGORY & SUBCATEGORY</th>
+                       <th class="audit-header" style="width: 15%; text-align: left;">ACCOUNT / WALLET</th>
+                       <th class="audit-header" style="width: 13%; text-align: left;">REASON FOR CHANGE</th>
+                       <th class="audit-header amount-header" style="width: 12%; text-align: right; padding-right: 32px;">AMOUNT</th>
+                     </tr>
+                   </thead>
+                   <tbody>
+                     ${[...dedupedAuditLogs]
+                       .sort((a, b) => new Date(b.date).getTime() - new Date(a.date).getTime())
+                       .slice(0, 100).map(log => `
+                       <tr>
+                         <td style="width: 12%; text-align: left; padding-left: 16px;">${new Date(log.date).toLocaleDateString()}</td>
+                         <td style="width: 20%; text-align: left;" title="${log.original_description}">${log.original_description}</td>
+                         <td style="width: 28%; text-align: left;">${log.original_category}${log.original_subcategory ? ` • ${log.original_subcategory}` : ''}</td>
+                         <td style="width: 15%; text-align: left;">${walletMap.get(log.wallet_id) || '—'}</td>
+                         <td style="width: 13%; text-align: left;">${log.reason || '—'}</td>
+                         <td class="audit-amount" style="width: 12%; padding-right: 24px;">${fmt(Number(log.original_amount || 0))}</td>
+                       </tr>
+                     `).join('')}
+                   </tbody>
+                 </table>
+               </div>
+               ` : `
+               <p style="margin-top: 16px; font-size: 12px; color: #94a3b8; text-align: center;">No deleted transactions in this reporting period.</p>
+               `}
+            </div>
+          </body>
+        </html>
+      `);
+      printWindow.document.close();
+    } catch (err) {
+      console.error("Critical failure compiling PDF layout stream:", err);
+    }
+  };
+
+  const handleExportCapitalVelocityReview = async () => {
+    try {
+      const allGoals = await db.savings_goals.toArray();
+      const allExpenses = await db.expenses.toArray();
+      const baseCurrencySymbol = CURRENCY_SYMBOLS[baseCurrency] || '₨';
+
+      let totalSweepVolume = 0;
+      let completedGoals = 0;
+      let partiallySpentGoals = 0;
+
+      const sweepExpenses = allExpenses.filter(e => 
+        e.category === 'Savings Transfer' && e.description?.includes('Auto-sweep')
+      );
+      totalSweepVolume = sumMoney(sweepExpenses.map(e => Math.abs(Number(e.amount) || 0)));
+
+      const doc = new jsPDF({ orientation: 'landscape' });
+
+      doc.setFontSize(18);
+      doc.setTextColor(96, 165, 250);
+      doc.text('Capital Velocity & Goal Lifecycle Review', 14, 20);
+      doc.setFontSize(10);
+      doc.setTextColor(160, 160, 160);
+      doc.text(`Automated Savings Allocation Analysis • Generated ${new Date().toLocaleDateString()}`, 14, 27);
+
+      const tableBody: (string | number)[][] = [];
+
+      for (const goal of allGoals) {
+        const goalName = goal.name;
+        const totalTargetCents = goal.target_amount || 0;
+        const goalExpenses = allExpenses.filter(e => 
+          e.description?.includes(goalName) ||
+          (e.destination_wallet_id === goal.id && e.category === 'Savings Transfer')
+        );
+        
+        const spentExpenses = goalExpenses.filter(e => 
+          e.type === 'expense' && e.category !== 'Savings Transfer'
+        );
+        
+        const reallocationTransfers = allExpenses.filter(e =>
+          e.description?.includes(goalName) && 
+          (e.description?.includes('reallocate') || e.description?.includes('Reallocated'))
+        );
+
+        const spentAmountCents = sumMoney(spentExpenses.map(e => Math.abs(Number(e.amount) || 0)));
+        const reallocatedAmountCents = sumMoney(reallocationTransfers.map(e => Math.abs(Number(e.amount) || 0)));
+        const remainingCents = totalTargetCents - spentAmountCents;
+
+        const goalDynamicBal = computeGoalDynamicBalance(goal.name, allExpenses);
+        if (goalDynamicBal >= goal.target_amount && goalDynamicBal > 0) {
+          completedGoals++;
+        } else if (spentAmountCents > 0 || reallocatedAmountCents > 0) {
+          partiallySpentGoals++;
+        }
+
+        const status = remainingCents > 0 ? 'Active' : 'Closed';
+        const closurePath = remainingCents > 0 && spentAmountCents > 0
+          ? 'Partially Spent on Asset Purchase'
+          : spentAmountCents > 0 ? 'Fully Spent'
+          : reallocatedAmountCents > 0 ? 'Reallocated'
+          : 'Active / Accumulating';
+
+        tableBody.push([
+          stripEmoji(goalName),
+          status,
+          pdfMoney(totalTargetCents, baseCurrency),
+          pdfMoney(spentAmountCents, baseCurrency),
+          pdfMoney(remainingCents, baseCurrency),
+          closurePath
+        ]);
+      }
+
+      autoTable(doc, {
+        head: [['Goal Name', 'Status', 'Total Target', 'Spent Amount', 'Remaining Balance', 'Closure Path Description']],
+        body: tableBody,
+        theme: 'striped',
+        columnStyles: { 5: { cellWidth: 45 } },
+        styles: { fontSize: 9, cellPadding: 3 },
+        headStyles: { fillColor: [96, 165, 250], fontSize: 10, fontStyle: 'bold' },
+        startY: 32,
+      });
+
+      const yAfterTable = (doc as any).lastAutoTable.finalY + 10;
+      doc.setFontSize(10);
+      doc.setTextColor(160, 160, 160);
+      doc.text(`Total Sweep Volume: ${pdfMoney(totalSweepVolume, baseCurrency)}  |  Completed: ${completedGoals}  |  Partially Spent: ${partiallySpentGoals}`, 14, yAfterTable);
+
+      renderAuditSummaryNotes(doc, allGoals, baseCurrency, allExpenses);
+
+      const pdfBlob = doc.output('blob');
+      const url = URL.createObjectURL(pdfBlob);
+      window.open(url, '_blank');
+
+      toast.success('Capital Velocity Review PDF opened in new tab');
+    } catch (error) {
+      console.error("Failed to generate Capital Velocity Review:", error);
+      toast.error("Failed to generate Capital Velocity Review PDF");
+    }
+  };
+
+  const exportGoalLifecycleExcel = async () => {
+    try {
+      const allGoals = await db.savings_goals.toArray();
+      const allExpenses = await db.expenses.toArray();
+      const baseCurrencySymbol = CURRENCY_SYMBOLS[baseCurrency] || '₨';
+
+      const workbook = new ExcelJS.Workbook();
+      const worksheet = workbook.addWorksheet('Goal Lifecycle Audit');
+
+      worksheet.mergeCells('A1', 'G1');
+      const titleCell = worksheet.getCell('A1');
+      titleCell.value = 'Goal Lifecycle Audit Report';
+      titleCell.font = { size: 16, bold: true };
+      titleCell.alignment = { horizontal: 'center' };
+
+      const headers = ['Goal Name', 'Status', 'Total Target', 'Spent Amount', 'Remaining Balance', 'Reallocated Amount', 'Closure Path'];
+      const headerRow = worksheet.addRow(headers);
+      headerRow.font = { bold: true };
+      headerRow.fill = { type: 'pattern', pattern: 'solid', fgColor: '60A5FA' };
+
+      const noteData: { name: string; remainingCents: number }[] = [];
+
+      for (const goal of allGoals) {
+        const goalName = goal.name;
+        const totalTargetCents = goal.target_amount || 0;
+        const spentExpenses = allExpenses.filter(e => 
+          e.description?.includes(goalName) && 
+          e.type === 'expense' && 
+          e.category !== 'Savings Transfer'
+        );
+        const reallocationTransfers = allExpenses.filter(e =>
+          e.description?.includes(goalName) && 
+          (e.description?.includes('reallocate') || e.description?.includes('Reallocated'))
+        );
+
+        const totalTargetUnits = totalTargetCents / 100;
+        const spentAmountCents = sumMoney(spentExpenses.map(e => Math.abs(Number(e.amount) || 0)));
+        const spentAmountUnits = spentAmountCents / 100;
+        const reallocatedAmountCents = sumMoney(reallocationTransfers.map(e => Math.abs(Number(e.amount) || 0)));
+        const reallocatedAmountUnits = reallocatedAmountCents / 100;
+        const remainingBalanceUnits = totalTargetUnits - spentAmountUnits;
+
+        let status = 'Active';
+        if ((goal.current_amount || 0) >= goal.target_amount && (goal.current_amount || 0) > 0) {
+          status = 'Completed';
+        } else if (remainingBalanceUnits <= 0 && (spentAmountUnits > 0 || reallocatedAmountUnits > 0)) {
+          status = 'Closed';
+        }
+
+        const closurePath = remainingBalanceUnits > 0 && spentAmountUnits > 0
+          ? 'Partially Spent on Asset Purchase'
+          : spentAmountUnits > 0 && reallocatedAmountUnits > 0
+            ? `Partial Spend / Reallocated (${formatMoney(spentAmountCents, baseCurrencySymbol)} spent, ${formatMoney(reallocatedAmountCents, baseCurrencySymbol)} shifted)`
+            : spentAmountUnits > 0
+              ? 'Partially Spent'
+              : reallocatedAmountUnits > 0
+                ? 'Reallocated'
+                : 'Active';
+
+        const remainingCents = totalTargetCents - spentAmountCents;
+        worksheet.addRow([
+          goalName,
+          status,
+          formatMoney(totalTargetCents, baseCurrencySymbol),
+          formatMoney(spentAmountCents, baseCurrencySymbol),
+          formatMoney(remainingCents, baseCurrencySymbol),
+          formatMoney(reallocatedAmountCents, baseCurrencySymbol),
+          closurePath
+        ]);
+
+        if (remainingCents > 0) {
+          noteData.push({ name: goalName, remainingCents });
+        }
+      }
+
+      worksheet.getColumn('A').width = 25;
+      worksheet.getColumn('B').width = 15;
+      worksheet.getColumn('C').width = 15;
+      worksheet.getColumn('D').width = 20;
+      worksheet.getColumn('E').width = 18;
+      worksheet.getColumn('F').width = 20;
+      worksheet.getColumn('G').width = 40;
+
+      worksheet.addRow([]);
+      for (const note of noteData) {
+        worksheet.addRow(['📋 Audit Summary Note & Project Review:', `Goal "${note.name}" remains Active with a remaining balance of ${formatMoney(note.remainingCents, baseCurrencySymbol)} reserved for ongoing expenses and maintenance.`]);
+      }
+
+      const buffer = await workbook.xlsx.writeBuffer();
+      const blob = new Blob([buffer], { type: 'application/vnd.openxmlformats-officedocument.spreadsheetml.sheet' });
+      const url = URL.createObjectURL(blob);
+      const link = document.createElement('a');
+      link.setAttribute('href', url);
+      link.setAttribute('download', `Goal_Lifecycle_Audit_${new Date().toISOString().split('T')[0]}.xlsx`);
+      link.style.visibility = 'hidden';
+      document.body.appendChild(link);
+      link.click();
+      document.body.removeChild(link);
+      URL.revokeObjectURL(url);
+      toast.success('Goal Lifecycle Audit exported to Excel');
+    } catch (error) {
+      console.error("Failed to export Goal Lifecycle Excel:", error);
+      toast.error("Failed to export Goal Lifecycle Audit");
+    }
+  };
+
+  const downloadReportAsTxt = (content: string) => {
+    try {
+      const blob = new Blob([content], { type: 'text/plain;charset=utf-8;' });
+      const url = URL.createObjectURL(blob);
+      const link = document.createElement('a');
+      link.setAttribute('href', url);
+      link.setAttribute('download', `ClearSum_Windows_Financial_Snapshot_${new Date().toISOString().split('T')[0]}.txt`);
+      link.style.visibility = 'hidden';
+      
+      document.body.appendChild(link);
+      link.click();
+      document.body.removeChild(link);
+      URL.revokeObjectURL(url);
+
+      setShowSummaryModal(false);
+      console.log("Weekly text snapshot successfully downloaded to machine.");
+    } catch (error) {
+      console.error("Failed to download report:", error);
+    }
+  };
+
+  const handleFileSelected = (event: React.ChangeEvent<HTMLInputElement>) => {
+    const file = event.target.files?.[0];
+    if (file) {
+      setRestoreFile(file);
+      setRestoreDialogOpen(true);
+    }
+  };
+
+  const handleConfirmRestore = async () => {
+    if (!restoreFile) return;
+
+    try {
+      console.log("Terminating active database connections to release locks...");
+
+      await db.delete();
+      console.log("Old database purged. Re-importing backup file onto disk...");
+
+      await importDB(restoreFile, {
+        overwriteValues: true
+      });
+
+      console.log("Database restoration complete! Reloading application workspace...");
+      window.location.href = '/';
+    } catch (error) {
+      console.error("Critical failure during database restoration process:", error);
+      toast.error("Failed to restore backup file. Please ensure it is a valid backup JSON.");
+      try { await db.open(); } catch (_) {}
+    } finally {
+      setRestoreDialogOpen(false);
+      setRestoreFile(null);
+    }
+  };
+
+  const handleCancelRestore = () => {
+    setRestoreDialogOpen(false);
+    setRestoreFile(null);
+  };
+
+  const allFilteredCats = useMemo(() =>
+    categories.filter(c => c.name !== 'Savings Transfer')
+      .filter(c => categoryTypeFilter === 'all' || c.type === categoryTypeFilter),
+    [categories, categoryTypeFilter]
+  );
+
+  const mainCategoriesFiltered = useMemo(() =>
+    allFilteredCats.filter(c => c.parent_id === null || c.parent_id === undefined),
+    [allFilteredCats]
+  );
+
+  const subCategoriesFlat = useMemo(() =>
+    allFilteredCats.filter(c => c.parent_id != null),
+    [allFilteredCats]
+  );
+
+  const subCategoriesByParent = useMemo(() => {
+    const map: Record<number, typeof categories> = {};
+    for (const sub of subCategoriesFlat) {
+      const pid = sub.parent_id!;
+      if (!map[pid]) map[pid] = [];
+      map[pid].push(sub);
+    }
+    return map;
+  }, [subCategoriesFlat]);
+
+  const budgetLookupMap = useMemo(() => {
+    const map = new Map<string, typeof budgets[0]>();
+    for (const b of budgets) map.set(b.category_name, b);
+    return map;
+  }, [budgets]);
+
+  // Pre-compute per-subcategory spent amounts: Map<subCategoryId, spentAmount>
+  // Matches on expense.subcategory (stores the subcategory name when a subcategory is selected)
+  // Uses double-entry: expenses add, income/refunds subtract
+  const subSpentMap = useMemo(() => {
+    const nameToId = new Map<string, number>();
+    for (const sub of subCategoriesFlat) nameToId.set(sub.name, sub.id!);
+    const map = new Map<number, number>();
+    for (const e of expenses) {
+      const subName = e.subcategory;
+      if (!subName) continue;
+      const subId = nameToId.get(subName);
+      if (subId !== undefined) {
+        const sign = String(e.type).toLowerCase() === 'income' ? -1 : 1;
+        map.set(subId, (map.get(subId) || 0) + sign * (Number(e.amount) || 0));
+      }
+    }
+    return map;
+  }, [expenses, subCategoriesFlat]);
+
+  // Pre-compute parent category totals: matches on expense.category (parent name)
+  const parentSpentMap = useMemo(() => {
+    const map = new Map<number, number>();
+    const parentNameToId = new Map<string, number>();
+    for (const p of mainCategoriesFiltered) parentNameToId.set(p.name, p.id!);
+    for (const e of expenses) {
+      const parentId = parentNameToId.get(e.category);
+      if (parentId !== undefined) {
+        const sign = String(e.type).toLowerCase() === 'income' ? -1 : 1;
+        map.set(parentId, (map.get(parentId) || 0) + sign * (Number(e.amount) || 0));
+      }
+    }
+    return map;
+  }, [expenses, mainCategoriesFiltered]);
+
+  const organizedCategories = useMemo(() =>
+    mainCategoriesFiltered.map(parent => {
+      const children = subCategoriesByParent[parent.id!] || [];
+      const subSpents: Record<number, number> = {};
+      for (const child of children) {
+        subSpents[child.id!] = subSpentMap.get(child.id!) || 0;
+      }
+      const parentSpent = parentSpentMap.get(parent.id!) || 0;
+      return { parent, subcategories: children, parentSpent, subSpents };
+    }),
+    [mainCategoriesFiltered, subCategoriesByParent, subSpentMap, parentSpentMap]
+  );
+
+  const walletNetWorth = useMemo(() =>
+    sumMoney(wallets.map(w => Number(w.balance || 0))),
+    [wallets]
+  );
+
+  const handleAddSubcategory = useCallback((parentId: number) => {
+    setSelectedParentId(parentId);
+    setIsSubcategory(true);
+    setNewCategoryName('');
+    setCategoryDialogOpen(true);
+  }, []);
+
+  const renderCategoryItem = useCallback((index: number, { parent, subcategories, parentSpent, subSpents }: typeof organizedCategories[0]) => {
+    const budget = budgetLookupMap.get(parent.name);
+    const isEditing = editingInlineCategory?.id === parent.id;
+    
+    // Calculate if main category has transactions (separate from subcategory transactions)
+    const hasMainCategoryTransactions = parent.parent_id == null && expenses.some(e => e.category === parent.name);
+    
+    return (
+      <div className="pr-2 pb-2">
+        <CategoryRow
+          category={parent}
+          subcategories={subcategories}
+          isExpanded={expandedCategoryId === parent.id}
+          isEditing={isEditing}
+          editingName={editingInlineCategory?.name ?? ''}
+          editingBudget={editingInlineCategory?.budget ?? 0}
+          budget={budget}
+          parentSpent={parentSpent}
+          subSpents={subSpents}
+          baseCurrency={baseCurrency}
+          hasMainCategoryTransactions={hasMainCategoryTransactions}
+          onToggle={handleToggleCategory}
+          onStartInlineEdit={handleStartInlineEdit}
+          onSaveInlineEdit={handleSaveInlineEdit}
+          onCancelInlineEdit={handleCancelInlineEdit}
+          onEditingNameChange={handleEditingNameChange}
+          onEditingBudgetChange={handleEditingBudgetChange}
+          onDeleteCategory={handleDeleteCategory}
+          onEditSubcategory={handleEditSubcategory}
+          onDeleteSubcategory={handleDeleteCategory}
+          onAddSubcategory={handleAddSubcategory}
+        />
+      </div>
+    );
+  }, [budgetLookupMap, editingInlineCategory, expandedCategoryId, baseCurrency, handleToggleCategory, handleStartInlineEdit, handleSaveInlineEdit, handleCancelInlineEdit, handleEditingNameChange, handleEditingBudgetChange, handleDeleteCategory, handleEditSubcategory, handleAddSubcategory, expenses]);
+
+  // Memoize Virtuoso props to prevent unnecessary re-renders
+  const virtuosoStyle = useMemo(() => ({ height: '350px' }), []);
+  const computeItemKey = useCallback((index: number, item: typeof organizedCategories[0]) => item.parent.id!, []);
+  const scrollSeekConfig = useMemo(() => ({
+    enter: (velocity: number) => Math.abs(velocity) > 800,
+    exit: (velocity: number) => Math.abs(velocity) < 100,
+    change: ScrollSeekPlaceholder,
+  }), []);
+
+  const { totalAllocatedBudget, totalCurrentMonthSpent } = useMemo(() => {
+    const parentCategoryNames = new Set(
+      categories.filter(c => c.parent_id == null).map(c => c.name)
+    );
+    const totalAllocatedBudget = sumMoney(
+      budgets
+        .filter(b => parentCategoryNames.has(b.category_name))
+        .map(b => b.limit_amount)
+    );
+    const now = new Date();
+    const currentMonth = now.getMonth();
+    const currentYear = now.getFullYear();
+    const totalCurrentMonthSpent = sumMoney(
+      expenses
+        .filter(e => {
+          if (!e.date) return false;
+          const d = new Date(e.date);
+          return d.getMonth() === currentMonth && d.getFullYear() === currentYear && String(e.type).toLowerCase() !== 'income';
+        })
+        .map(e => Number(e.amount) || 0)
+    );
+    return { totalAllocatedBudget, totalCurrentMonthSpent };
+  }, [categories, budgets, expenses]);
+
+  return (
+    <div className="w-full max-w-7xl mx-auto flex flex-col gap-6">
+      <div>
+        <h1 className="text-2xl font-bold">Settings</h1>
+        <p className="text-sm text-text-secondary mt-1">Manage your wallets, categories and preferences</p>
+      </div>
+
+      {/* Currency Settings */}
+      <div className="bg-card border border-border-main rounded-xl shadow-sm p-6">
+        <h2 className="text-lg font-semibold text-text-primary mb-4">Currency Settings</h2>
+        <div>
+          {/* ==================== BASE CURRENCY WITH ADD OPTION ==================== */}
+          <div className="flex items-start justify-between gap-6">
+            <div>
+              <p className="font-medium text-text-primary">Base Currency</p>
+              <p className="text-sm text-text-muted">All charts and calculations will use this currency as the display unit</p>
+            </div>
+
+            <div className="flex flex-col gap-3 w-full max-w-[280px]">
+              <CurrencySelector
+                value={baseCurrencyPreferenceState}
+                onChange={handleBaseCurrencyChange}
+                label=""
+                placeholder="Choose base currency"
+                className="w-full"
+              />
+              <button
+                onClick={() => { setSelectedWorldCurrency(null); setAddCurrencyDialogOpen(true); }}
+                className="w-full h-10 border border-neutral-200 rounded-md text-sm font-medium text-neutral-800 bg-white hover:bg-neutral-50 flex items-center justify-center gap-1.5 transition-colors cursor-pointer"
+              >
+                <Plus className="w-4 h-4" /> Add Currency if not in the list
+              </button>
+            </div>
+          </div>
+          {/* ==================================================================== */}
+        </div>
+      </div>
+
+      {/* Exchange Rate Mode */}
+      <div className="bg-card border border-border-main rounded-xl shadow-sm p-6">
+        <h2 className="text-lg font-semibold text-text-primary mb-4">Exchange Rate Mode</h2>
+        <div className="space-y-4">
+          <div className="flex items-center justify-between">
+            <div>
+              <p className="font-medium text-text-primary">Rate Source</p>
+              <p className="text-sm text-text-muted">Choose between live API rates or manually entered rates</p>
+            </div>
+            <Select value={rateMode} onValueChange={(v: 'api' | 'manual') => setRateMode(v)}>
+              <SelectTrigger className="w-48 px-3 py-2 bg-bg-input border border-border-main rounded-lg text-text-primary placeholder:text-text-muted focus:outline-none focus:ring-2 focus:ring-blue-500">
+                <SelectValue />
+              </SelectTrigger>
+              <SelectContent>
+                <SelectItem value="api">Live Automated (API)</SelectItem>
+                <SelectItem value="manual">Manual Fixed</SelectItem>
+              </SelectContent>
+            </Select>
+          </div>
+
+          {rateMode === 'api' && (
+            <div className="flex items-center justify-between p-3 rounded-lg bg-blue-50 dark:bg-blue-500/10 border border-blue-200 dark:border-blue-500/20">
+              <span className="text-xs font-medium text-blue-700 dark:text-blue-300 flex items-center gap-2">
+                <RefreshCw className={`w-4 h-4 ${fetchingRates ? 'animate-spin' : ''} text-blue-700 dark:text-blue-300`} />
+                Rates are automatically managed via live API
+              </span>
+              <button
+                onClick={fetchLiveRates}
+                disabled={fetchingRates}
+                className={"text-xs font-semibold px-3 py-1 rounded-full bg-blue-100 dark:bg-blue-500/20 text-blue-700 dark:text-blue-300 border border-blue-200 dark:border-blue-500/30 hover:bg-blue-200 dark:hover:bg-blue-500/30 transition-colors duration-150 " + (fetchingRates ? 'opacity-60 cursor-not-allowed' : 'cursor-pointer')}
+              >
+                {fetchingRates ? 'Fetching...' : 'Refresh Now'}
+              </button>
+            </div>
+          )}
+
+          <div className="overflow-y-auto max-h-[200px] mt-4 pr-1 scrollbar-thin">
+            <div className="grid grid-cols-6 gap-4">
+              {allCurrencyCodes.map(curr => {
+                const isCustom = !(ALL_CURRENCIES as readonly string[]).includes(curr);
+                return (
+                <div key={curr} className="space-y-1">
+                  <div className="flex items-center justify-between">
+                    <Label className="block text-sm font-medium text-text-secondary mb-1 text-xs">{getCurrencySymbol(curr, customCurrencies)} {curr}</Label>
+                    {isCustom && (
+                      <button
+                        onClick={() => handleDeleteCurrency(curr)}
+                        className="text-xs text-red-600 dark:text-red-400 hover:text-red-700 dark:hover:text-red-300 hover:bg-red-500/10 px-1.5 py-0.5 rounded-md transition-colors font-bold"
+                        title="Delete currency"
+                      >🗑️ Delete</button>
+                    )}
+                  </div>
+                  <Input
+                    type="number"
+                    step="0.00001"
+                    value={manualRates[curr] || ''}
+                    onChange={(e) => handleManualRateChange(curr, e.target.value)}
+                    placeholder="Rate"
+                    className="h-8 w-full px-3 py-2 bg-bg-input border border-border-main rounded-lg text-text-primary placeholder:text-text-muted focus:outline-none focus:ring-2 focus:ring-blue-500"
+                    disabled={rateMode === 'api'}
+                    readOnly={rateMode === 'api'}
+                  />
+                </div>
+              );
+            })}
+            </div>
+          </div>
+
+          <p className="text-[11px] font-semibold text-text-secondary mt-1 leading-relaxed">
+            Rates are represented as: <span className="text-text-primary font-bold">1 {baseCurrency} = X [Target Currency]</span>. 
+            Enter the conversion factor relative to your base currency selection.
+          </p>
+        </div>
+      </div>
+
+      {/* Add Currency Dialog */}
+      {addCurrencyDialogOpen && (
+        <div className="fixed inset-0 z-50 flex items-center justify-center bg-black/50 backdrop-blur-sm p-4" onClick={() => { setAddCurrencyDialogOpen(false); setSelectedWorldCurrency(null); }}>
+          <div className="bg-white dark:bg-slate-800 border border-border-main rounded-xl shadow-2xl p-6 w-full max-w-md" onClick={e => e.stopPropagation()}>
+            <h3 className="text-lg font-bold text-text-primary mb-4">Add Currency</h3>
+            <div className="space-y-4">
+              <div>
+                <Label className="block text-sm font-medium text-text-secondary mb-1">Select Currency</Label>
+                <Popover open={addCurrencySearchOpen} onOpenChange={setAddCurrencySearchOpen}>
+                  <PopoverTrigger asChild>
+                    <button
+                      role="combobox"
+                      aria-expanded={addCurrencySearchOpen}
+                      className="w-full flex items-center justify-between px-3 py-2 text-sm bg-bg-input border border-border-main rounded-lg text-text-primary placeholder:text-text-muted focus:outline-none focus:ring-2 focus:ring-blue-500"
+                    >
+                      {selectedWorldCurrency
+                        ? <span>{selectedWorldCurrency.symbol} {selectedWorldCurrency.code} — {selectedWorldCurrency.name}</span>
+                        : <span className="text-text-muted">Search and select a currency...</span>
+                      }
+                      <ChevronsUpDown className="ml-2 h-4 w-4 shrink-0 opacity-50" />
+                    </button>
+                  </PopoverTrigger>
+                  <PopoverContent className="w-[var(--radix-popover-trigger-width)] p-0 bg-white dark:bg-slate-800 border-border-main">
+                    <Command className="bg-white dark:bg-slate-800 rounded-lg">
+                      <CommandInput placeholder="Search currency by name or code..." className="text-text-primary" />
+                      <CommandList>
+                        <CommandEmpty className="text-text-muted py-6 text-center text-sm">No currency found.</CommandEmpty>
+                        <CommandGroup>
+                          {WORLD_CURRENCIES.map(wc => (
+                            <CommandItem
+                              key={wc.code}
+                              value={`${wc.code} ${wc.name}`}
+                              onSelect={() => {
+                                setSelectedWorldCurrency(wc);
+                                setAddCurrencySearchOpen(false);
+                              }}
+                              className="text-text-primary data-[selected=true]:bg-accent cursor-pointer flex items-center gap-2"
+                            >
+                              <Check
+                                className={`h-4 w-4 ${selectedWorldCurrency?.code === wc.code ? 'opacity-100' : 'opacity-0'}`}
+                              />
+                              <span className="w-6 text-center">{wc.symbol}</span>
+                              <span className="font-medium">{wc.code}</span>
+                              <span className="text-text-muted">— {wc.name}</span>
+                            </CommandItem>
+                          ))}
+                        </CommandGroup>
+                      </CommandList>
+                    </Command>
+                  </PopoverContent>
+                </Popover>
+              </div>
+
+              {selectedWorldCurrency && (
+                <>
+                  <div className="grid grid-cols-2 gap-3 p-3 bg-slate-50 dark:bg-slate-700/50 rounded-lg border border-border-main">
+                    <div>
+                      <Label className="block text-xs font-medium text-text-secondary">Code</Label>
+                      <p className="text-sm font-semibold text-text-primary mt-0.5">{selectedWorldCurrency.code}</p>
+                    </div>
+                    <div>
+                      <Label className="block text-xs font-medium text-text-secondary">Symbol</Label>
+                      <p className="text-sm font-semibold text-text-primary mt-0.5">{selectedWorldCurrency.symbol}</p>
+                    </div>
+                    <div className="col-span-2">
+                      <Label className="block text-xs font-medium text-text-secondary">Name</Label>
+                      <p className="text-sm font-semibold text-text-primary mt-0.5">{selectedWorldCurrency.name}</p>
+                    </div>
+                  </div>
+                </>
+              )}
+
+              <div className="flex gap-2 justify-end pt-2">
+                <button
+                  onClick={() => { setAddCurrencyDialogOpen(false); setSelectedWorldCurrency(null); }}
+                  className="px-4 py-2 text-sm font-medium text-text-secondary border border-border-main rounded-lg hover:bg-bg-input transition-colors"
+                >
+                  Cancel
+                </button>
+                <button
+                  onClick={async () => {
+                    const wc = selectedWorldCurrency;
+                    if (!wc) { toast.error('Please select a currency from the list.'); return; }
+
+                    await db.currencies.add({
+                      code: wc.code,
+                      name: wc.name,
+                      symbol: wc.symbol,
+                      isDefault: false,
+                      is_custom: true,
+                    });
+
+                    addCustomCurrency({ code: wc.code, symbol: wc.symbol });
+
+                    if (rateMode === 'api') {
+                      const initialRate = DEFAULT_EXCHANGE_RATES[wc.code] || 1;
+                      setExchangeRates({ ...rates, [wc.code]: initialRate * (rates[baseCurrency] || 1) });
+                      fetchLiveRates();
+                    } else {
+                      setExchangeRates({ ...rates, [wc.code]: 1 * (rates[baseCurrency] || 1) });
+                    }
+
+                    await fetchCurrencies();
+
+                    setAddCurrencyDialogOpen(false);
+                    setSelectedWorldCurrency(null);
+
+                    toast.success(`${wc.name} (${wc.code}) added.`);
+                  }}
+                  className="px-4 py-2 text-sm font-medium border-2 border-blue-600/30 text-blue-600 hover:bg-emerald-500 hover:text-white rounded-lg transition-colors"
+                >
+                  Add
+                </button>
+              </div>
+            </div>
+          </div>
+        </div>
+      )}
+
+{/* --- START OF LIQUIDITY GUARDRAILS SYSTEM CARD --- */}
+      <div className="bg-card border border-border-main rounded-xl shadow-sm p-6">
+
+        {/* GLOBAL MASTER SWEEP VALVE */}
+        <div className="p-4 bg-slate-50 dark:bg-slate-700/50 border border-border-main rounded-xl space-y-3 mb-6">
+          <div className="flex justify-between items-center">
+            <label className="text-xs font-bold text-text-secondary uppercase tracking-wider">
+              🌐 Global Auto-Sweep Master Valve
+            </label>
+            <div className="flex items-center gap-2">
+              <input
+                type="number"
+                min={0}
+                max={100}
+                value={masterValve}
+                onChange={(e) => {
+                  const v = Math.max(0, Math.min(100, Number(e.target.value) || 0));
+                  setMasterValve(v);
+                  localStorage.setItem('globalMasterValue', String(v));
+                  setIsDirty(true);
+                }}
+                className="w-20 text-xs font-mono font-bold text-indigo-600 dark:text-indigo-400 bg-indigo-50 dark:bg-indigo-950/40 px-2 py-0.5 rounded border border-indigo-200 dark:border-indigo-800 text-right"
+              />
+              <span className="text-xs font-mono font-bold text-text-muted">%</span>
+            </div>
+          </div>
+          <input
+            type="range"
+            min={0}
+            max={100}
+            step={1}
+            value={masterValve}
+            onChange={(e) => {
+              const v = Number(e.target.value);
+              setMasterValve(v);
+              localStorage.setItem('globalMasterValue', String(v));
+              setIsDirty(true);
+            }}
+            className="w-full h-1.5 bg-slate-200 dark:bg-white/10 rounded-lg appearance-none cursor-pointer accent-indigo-600"
+          />
+          <p className="text-[10px] text-text-muted leading-tight">
+            * Total percentage of surplus pulled from your main checking account into the Shared Savings Pool. Individual goal sliders divide this pool among themselves.
+          </p>
+        </div>
+
+        {/* Header Section matching ClearSum Typography specs */}
+        <div className="mb-5">
+          <h3 className="text-base font-semibold text-text-primary flex items-center gap-2">
+            🛡️ Automated Liquidity Guardrails
+          </h3>
+          <p className="text-xs text-text-muted mt-0.5">
+            Configure the systemic safety floors and capital shields that govern real-time Auto-Sweep algorithms.
+          </p>
+        </div>
+
+        {/* UNIFORM THREE-COLUMN GRID LAYOUT */}
+        <div className="grid grid-cols-1 lg:grid-cols-3 gap-5">
+
+           {/* CARD 1: SAFETY FLOOR SLIDER */}
+            <div className="p-4 bg-slate-50 dark:bg-slate-700/50 border border-border-main rounded-xl space-y-3">
+             <div className="flex justify-between items-center">
+               <label className="text-xs font-bold text-text-secondary uppercase tracking-wider">
+                 Locked Safety Floor
+               </label>
+               <div className="flex items-center gap-2">
+                 <input
+                   type="number"
+                   min={0}
+                   max={Math.floor(maxSafetyFloorAllowed)}
+                   value={localSafetyFloor}
+                   onChange={(e) => {
+                     const v = Math.max(0, Math.min(maxSafetyFloorAllowed, Number(e.target.value) || 0));
+                     setLocalSafetyFloor(v);
+                     setIsDirty(true);
+                   }}
+                   className="w-20 text-xs font-mono font-bold text-blue-600 dark:text-blue-400 bg-blue-50 dark:bg-blue-950/40 px-2 py-0.5 rounded border border-blue-200 dark:border-blue-800 text-right"
+                 />
+                 <span className="text-xs font-mono font-bold text-blue-600 dark:text-blue-400 bg-blue-50 dark:bg-blue-950/40 px-2 py-0.5 rounded">
+                     {formatMoney(localSafetyFloor * 100, baseCurrency)}
+                 </span>
+               </div>
+             </div>
+             <input
+               type="range"
+               min={0}
+               max={maxSafetyFloorAllowed}
+               step={1}
+               value={localSafetyFloor}
+               onChange={(e) => { setLocalSafetyFloor(Number(e.target.value)); setIsDirty(true); }}
+               className="w-full h-1.5 bg-slate-200 dark:bg-white/10 rounded-lg appearance-none cursor-pointer accent-blue-600"
+             />
+            <p className="text-[10px] text-text-muted leading-tight">
+                * Algorithmic sweeps halt instantly if your available balance falls below this marker line.
+              </p>
+          </div>
+
+           {/* CARD 2: CAPITAL SHIELD SLIDER */}
+            <div className="p-4 bg-slate-50 dark:bg-slate-700/50 border border-border-main rounded-xl space-y-3">
+             <div className="flex justify-between items-center">
+               <label className="text-xs font-bold text-text-secondary uppercase tracking-wider">
+                 Reserved Capital Shield
+               </label>
+               <div className="flex items-center gap-2">
+                 <input
+                   type="number"
+                   min={0}
+                   max={Math.floor(maxCapitalShieldAllowed)}
+                   value={localCapitalShield}
+                   onChange={(e) => {
+                     const v = Math.max(0, Math.min(maxCapitalShieldAllowed, Number(e.target.value) || 0));
+                     setLocalCapitalShield(v);
+                     setIsDirty(true);
+                   }}
+                   className="w-20 text-xs font-mono font-bold text-emerald-600 dark:text-emerald-400 bg-emerald-50 dark:bg-emerald-950/40 px-2 py-0.5 rounded border border-emerald-200 dark:border-emerald-800 text-right"
+                 />
+                 <span className="text-xs font-mono font-bold text-emerald-600 dark:text-emerald-400 bg-emerald-50 dark:bg-emerald-950/40 px-2 py-0.5 rounded">
+                     {formatMoney(localCapitalShield * 100, baseCurrency)}
+                 </span>
+               </div>
+             </div>
+             <input
+               type="range"
+               min={0}
+               max={maxCapitalShieldAllowed}
+               step={1}
+               value={localCapitalShield}
+               onChange={(e) => { setLocalCapitalShield(Number(e.target.value)); setIsDirty(true); }}
+               className="w-full h-1.5 bg-slate-200 dark:bg-white/10 rounded-lg appearance-none cursor-pointer accent-emerald-600"
+             />
+<p className="text-[10px] text-text-muted leading-tight">
+                * Protects completed goals (like college) from being double-counted by the sweep engine.
+              </p>
+          </div>
+
+           {/* CARD 3: SWEEP FREQUENCY */}
+           <div className="p-4 bg-slate-50 dark:bg-slate-700/50 border border-border-main rounded-xl space-y-3">
+            <label className="text-xs font-bold text-text-secondary uppercase tracking-wider">
+              Sweep Frequency
+            </label>
+            <div className="grid grid-cols-3 gap-1.5 bg-card border border-border-main rounded-lg p-0.5">
+                {(['Daily', 'Weekly', 'Monthly'] as const).map((freq) => (
+                  <label 
+                    key={freq}
+                    className={`text-center text-xs font-bold py-1 rounded cursor-pointer transition-colors duration-150 shadow-sm ${
+                      localFrequency === freq.toLowerCase()
+                        ? 'bg-purple-600 text-white'
+                        : 'text-text-secondary hover:text-text-primary'
+                    }`}
+                  >
+                    <input 
+                      type="radio" name="sweep_freq" checked={localFrequency === freq.toLowerCase()}
+                      onChange={(e) => { 
+                        const newFreq = freq.toLowerCase(); 
+                        if (localFrequency !== newFreq) { 
+                          setLocalFrequency(newFreq); 
+                          setIsDirty(true); 
+                        } 
+                      }}
+                      className="sr-only"
+                    />
+                    {freq}
+                  </label>
+                ))}
+            </div>
+            <p className="text-[10px] text-text-muted leading-tight">
+              * Surplus funds automatically allocated to active savings goals <span className="text-purple-600 dark:text-purple-300 font-semibold">{localFrequency ? localFrequency.charAt(0).toUpperCase() + localFrequency.slice(1) : 'Not selected'}</span>.
+            </p>
+            <div className="bg-indigo-50 border-l-4 border-indigo-500 p-4 rounded-r-lg mt-2">
+              <p className="text-sm text-indigo-700 font-medium">
+                💡 <strong>Multi-Goal Allocation Active:</strong> Percentage weights are now managed dynamically directly on your individual Savings Goal cards on the Analytics Screen. Adjust custom sliders or type integers directly on your goals to route your wealth pool.
+              </p>
+            </div>
+          </div>
+
+        </div>
+
+        {/* END OF MONTH SURPLUS RULE SELECTOR */}
+        <div className="mt-4 p-4 bg-slate-50 dark:bg-slate-700/50 rounded-xl border border-border-main flex items-center justify-between flex-col sm:flex-row gap-4">
+          <div className="space-y-0.5">
+            <h4 className="text-xs font-bold uppercase tracking-wider text-text-secondary">
+              End-of-Month Budget Surplus Rule
+            </h4>
+            <p className="text-[11px] text-text-muted">
+              Choose whether unused category limits remain in your wallet as rollover balances or get automatically extracted to fund active savings goals.
+            </p>
+          </div>
+          <select 
+            value={budgetSurplusRule}
+            onChange={(e) => setBudgetSurplusRule(e.target.value as 'wallet' | 'sweep')}
+            className="px-3 py-1.5 border border-border-main rounded-lg bg-bg-input text-xs font-medium outline-none shadow-sm focus:border-purple-500 text-text-primary"
+          >
+            <option value="wallet">Keep In Wallet (Rollover)</option>
+            <option value="sweep">Extract to Savings Vault (Sweep)</option>
+          </select>
+        </div>
+
+        {/* Commit Operational Action Panel */}
+        <div className="mt-5 flex justify-end gap-3 border-t border-border-main pt-4">
+          <div className="relative group">
+            <button
+              onClick={handleManualSweepButtonClick}
+              className="px-3 py-1.5 bg-bg-input hover:bg-slate-200 dark:hover:bg-slate-700 text-text-secondary hover:text-text-primary text-xs font-medium rounded-md shadow-sm cursor-pointer transition-all duration-200 ease-out active:scale-[0.98] transform will-change-transform select-none"
+            >
+              ⚡ Run Manual Sweep Now
+            </button>
+            <div className="absolute bottom-full left-1/2 -translate-x-1/2 mb-2 hidden group-hover:block w-56 p-2 bg-slate-900 text-white text-[10px] rounded-lg shadow-xl z-50 text-center font-normal leading-normal">
+              Manually trigger a sweep regardless of frequency schedule.
+            </div>
+          </div>
+          
+          <button
+            disabled={!isDirty || isProcessing}
+            onClick={async () => {
+              if (isProcessing) return;
+              setIsProcessing(true);
+              try {
+                  setSafetyFloor(localSafetyFloor);
+                  setLockedSavings(localCapitalShield);
+                setSweepPercentage(localSweepRatio);
+                if (localFrequency) {
+                  setSweepFrequency(localFrequency);
+                }
+                const existingSettings = await db.settings.get(1);
+                const updateFields: Record<string, any> = { ...(existingSettings || {}), id: 1, safety_floor: localSafetyFloor * 100, capital_shield: localCapitalShield * 100, sweep_allocation_ratio: localSweepRatio };
+                if (localFrequency) {
+                  updateFields.sweep_frequency = localFrequency;
+                }
+                await db.settings.put(updateFields);
+                localStorage.setItem('globalMasterValue', String(masterValve));
+                setIsDirty(false);
+                toast.success('Guardrail settings saved');
+                if (localFrequency) {
+                  const forceSweep = getGlobalForceSweepRef();
+                  if (forceSweep) { await forceSweep(); }
+                }
+              } catch (err) {
+                console.error('Save Guardrail Changes error:', err);
+                toast.error('Failed to save guardrails: ' + (err instanceof Error ? err.message : String(err)));
+              } finally {
+                setIsProcessing(false);
+              }
+            }}
+            className={`px-4 py-1.5 text-xs font-medium rounded-md shadow-sm transition-all duration-200 ease-out will-change-transform select-none ${
+              !isDirty || isProcessing
+                ? 'bg-slate-300 dark:bg-slate-700 text-text-muted cursor-not-allowed'
+                : 'bg-blue-600 hover:bg-blue-700 active:bg-blue-800 active:scale-[0.98] transform text-white cursor-pointer shadow-md'
+            }`}
+          >
+            Save Guardrail Changes
+          </button>
+        </div>
+
+      </div>
+      {/* --- END OF LIQUIDITY GUARDRAILS SYSTEM CARD --- */}
+
+      {/* Wallets + Categories Side-by-Side Grid (Equal Height, Full Width) */}
+      <div className="grid grid-cols-1 lg:grid-cols-2 gap-6 items-stretch w-full">
+
+        {/* LEFT COLUMN: Manage Wallets */}
+        <div className="bg-card border border-border-main rounded-xl shadow-sm p-6 flex flex-col justify-between h-full">
+          <div>
+            <div className="flex justify-between items-center mb-4">
+              <h3 className="font-semibold text-text-primary">Manage Wallets</h3>
+              <button onClick={() => setWalletDialogOpen(true)} className="inline-flex items-center justify-center gap-1.5 h-8 rounded-md px-3 text-xs font-medium border-2 border-blue-600/30 hover:bg-emerald-500 hover:text-white text-blue-600 transition-colors cursor-pointer shrink-0">
+                <Plus className="w-4 h-4" /> Add Wallet
+              </button>
+            </div>
+
+{wallets.length > 0 && (
+               <div className="mb-4 p-3 bg-blue-50 dark:bg-blue-900/20 rounded-lg flex justify-between items-center">
+                 <span className="font-medium text-text-primary">Total Net Worth ({baseCurrency})</span>
+                 <span className="font-bold text-text-primary text-lg">
+                    {formatMoney(walletNetWorth, baseCurrency)}
+                 </span>
+               </div>
+             )}
+
+            {wallets.length === 0 ? (
+              <p className="text-text-muted">No wallets yet. Add one to get started.</p>
+) : (
+                <div className="w-full max-h-[300px] min-h-[300px] overflow-y-auto pr-2 scrollbar-thin flex flex-col gap-3">
+                  {wallets.map(wallet => (
+                    <div key={wallet.id} className="flex items-center justify-between p-3 rounded-lg bg-slate-50 dark:bg-slate-700/50 border border-border-main hover:bg-slate-100 dark:hover:bg-slate-800/50 hover:border-blue-500/20 transition-colors duration-150 text-xs mb-2">
+                      <div>
+                        <p className="text-text-primary font-semibold">{wallet.name}</p>
+                        <p className="text-xs text-text-secondary font-medium capitalize">{wallet.type} - {wallet.currency || baseCurrency}</p>
+                      </div>
+                      <div className="flex items-center gap-4">
+                        <span className="font-semibold text-text-primary">{formatMoney(wallet.balance, baseCurrency)}</span>
+                        <Button variant="ghost" size="icon" onClick={() => handleEditWalletClick(wallet)}>
+                          <Pencil className="w-4 h-4" />
+                        </Button>
+                        <Button variant="ghost" size="icon" onClick={() => handleDeleteWallet(wallet.id)}>
+                          <Trash2 className="w-4 h-4 text-red-600 dark:text-red-400" />
+                        </Button>
+                      </div>
+                    </div>
+                ))}
+              </div>
+            )}
+          </div>
+        </div>
+
+        {/* RIGHT COLUMN: Manage Categories */}
+        <div className="bg-card border border-border-main rounded-xl shadow-sm p-6 flex flex-col justify-between h-full">
+          <div>
+            <div className="flex justify-between items-center mb-4">
+              <h3 className="font-semibold text-text-primary">Manage Categories</h3>
+              <button onClick={() => setCategoryDialogOpen(true)} className="inline-flex items-center justify-center gap-1.5 h-8 rounded-md px-3 text-xs font-medium border-2 border-blue-600/30 hover:bg-emerald-500 hover:text-white text-blue-600 transition-colors cursor-pointer shrink-0">
+                <Plus className="w-4 h-4" /> Add Category
+              </button>
+            </div>
+
+            <div className="mb-4 p-3 bg-blue-50 dark:bg-blue-900/20 rounded-lg flex justify-between items-center">
+              <span className="font-medium text-text-primary">Category Structure</span>
+              <span className="font-bold text-text-primary text-sm">
+                {mainCategoriesFiltered.length} Main Categories ({subCategoriesFlat.length} Subcategories)
+              </span>
+            </div>
+
+            <div className="flex gap-1 mb-3">
+              {(['all', 'expense', 'income'] as const).map(t => (
+                <button
+                  key={t}
+                  onClick={() => { setCategoryTypeFilter(t); setExpandedCategoryId(null); }}
+                  className={`px-3 py-1 text-xs font-medium rounded-md transition-colors cursor-pointer capitalize ${
+                    categoryTypeFilter === t
+                      ? 'bg-emerald-500 text-white'
+                      : 'bg-bg-input text-text-muted hover:text-text-primary'
+                  }`}
+                >
+                  {t === 'all' ? 'All' : t}
+                </button>
+              ))}
+            </div>
+
+            <Virtuoso
+              style={virtuosoStyle}
+              data={organizedCategories}
+              overscan={200}
+              computeItemKey={computeItemKey}
+              scrollSeek={scrollSeekConfig}
+              itemContent={renderCategoryItem}
+            />
+          </div>
+        </div>
+
+      </div>
+
+      {/* Wallet Add/Edit Dialogs (moved to bottom of layout for grid) */}
+      <Dialog open={walletDialogOpen} onOpenChange={setWalletDialogOpen}>
+        <DialogContent className="bg-white dark:bg-slate-800 border border-border-main">
+          <DialogHeader>
+            <DialogTitle className="text-text-primary">Add New Wallet</DialogTitle>
+          </DialogHeader>
+          <div className="space-y-4 py-4">
+            <div className="space-y-2">
+              <Label className="block text-sm font-medium text-text-secondary mb-1">Wallet Name</Label>
+              <Input value={newWalletName} onChange={(e) => setNewWalletName(e.target.value)} placeholder="e.g., Main Bank" className="w-full px-3 py-2 bg-bg-input border border-border-main rounded-lg text-text-primary placeholder:text-text-muted focus:outline-none focus:ring-2 focus:ring-blue-500" />
+            </div>
+            <div className="space-y-2">
+              <Label className="block text-sm font-medium text-text-secondary mb-1">Initial Balance</Label>
+              <Input
+                type="number"
+                step="0.01"
+                value={newWalletBalance}
+                onChange={(e) => setNewWalletBalance(e.target.value)}
+                className="w-full px-3 py-2 bg-bg-input border border-border-main rounded-lg text-text-primary placeholder:text-text-muted focus:outline-none focus:ring-2 focus:ring-blue-500"
+                placeholder="0.00"
+              />
+            </div>
+            {/* RESTORED WALLET TYPE SELECTOR MENU */}
+            <div className="mb-4 text-left">
+              <label className="block text-sm font-medium text-text-muted mb-1">Account / Wallet Type</label>
+              <select
+                value={newWalletType}
+                onChange={(e) => setNewWalletType(e.target.value)}
+                className="w-full bg-bg-input border border-border-main text-text-primary rounded-lg p-2.5 text-sm focus:outline-none focus:border-blue-500 cursor-pointer transition-colors"
+              >
+                <option value="bank">🏦 Bank Account</option>
+                <option value="cash">💵 Cash / Physical Wallet</option>
+                <option value="card">💳 Credit / Debit Card</option>
+                <option value="investment">📈 Investment Account</option>
+              </select>
+            </div>
+            <div className="space-y-2">
+              <Label className="block text-sm font-medium text-text-secondary mb-1">Currency</Label>
+              <Select value={baseCurrency} disabled>
+                <SelectTrigger className="w-full px-3 py-2 bg-bg-input border border-border-main rounded-lg text-text-primary placeholder:text-text-muted focus:outline-none focus:ring-2 focus:ring-blue-500 opacity-60 cursor-not-allowed">
+                  <SelectValue />
+                </SelectTrigger>
+                <SelectContent>
+                  {allCurrencyCodes.map(code => {
+                    const info = dbCurrencies.find(c => c.code === code);
+                    return (
+                      <SelectItem key={code} value={code}>{info ? `${info.symbol} ${info.code} — ${info.name}` : code}</SelectItem>
+                    );
+                  })}
+                </SelectContent>
+              </Select>
+            </div>
+          </div>
+          <DialogFooter>
+            <Button variant="outline" onClick={() => setWalletDialogOpen(false)}>Cancel</Button>
+            <Button className="bg-transparent border-2 border-blue-600/30 text-blue-600 hover:bg-emerald-500 hover:text-white" onClick={handleAddWallet}>Add Wallet</Button>
+          </DialogFooter>
+        </DialogContent>
+      </Dialog>
+
+      <Dialog open={!!editingWallet} onOpenChange={() => setEditingWallet(null)}>
+        <DialogContent className="bg-white dark:bg-slate-800 border border-border-main">
+          <DialogHeader>
+            <DialogTitle className="text-text-primary">Edit Wallet</DialogTitle>
+          </DialogHeader>
+          <div className="space-y-4 py-4">
+            <div className="space-y-2">
+              <Label className="block text-sm font-medium text-text-secondary mb-1">Wallet Name</Label>
+              <Input 
+                value={editingWallet?.name || ''} 
+                onChange={(e) => setEditingWallet(editingWallet ? { ...editingWallet, name: e.target.value } : null)}
+                className="w-full px-3 py-2 bg-bg-input border border-border-main rounded-lg text-text-primary placeholder:text-text-muted focus:outline-none focus:ring-2 focus:ring-blue-500"
+              />
+            </div>
+            <div className="space-y-2">
+              <Label className="block text-sm font-medium text-text-secondary mb-1">Type</Label>
+              <Select 
+                value={editingWallet?.type || 'bank'} 
+                onValueChange={(v) => setEditingWallet(editingWallet ? { ...editingWallet, type: v } : null)}
+              >
+                <SelectTrigger className="w-full px-3 py-2 bg-bg-input border border-border-main rounded-lg text-text-primary placeholder:text-text-muted focus:outline-none focus:ring-2 focus:ring-blue-500">
+                  <SelectValue />
+                </SelectTrigger>
+                <SelectContent>
+                  <SelectItem value="bank">Bank</SelectItem>
+                  <SelectItem value="cash">Cash</SelectItem>
+                  <SelectItem value="card">Card</SelectItem>
+                </SelectContent>
+              </Select>
+            </div>
+            <div className="mb-4 text-left">
+              <label className="block text-sm font-medium text-text-muted mb-1">Balance ({baseCurrency})</label>
+              <input
+                type="number"
+                step="0.01"
+                value={editBalance}
+                onChange={(e) => setEditBalance(parseFloat(e.target.value) || 0)}
+                className="w-full bg-bg-input border border-border-main text-text-primary rounded-lg p-2.5 text-sm focus:outline-none focus:border-blue-500"
+                placeholder="0.00"
+              />
+              <p className="text-[10px] text-text-muted mt-1">Enter new balance in {baseCurrency}. An adjustment transaction will be created automatically.</p>
+            </div>
+            <div className="space-y-2">
+              <Label className="block text-sm font-medium text-text-secondary mb-1">Currency</Label>
+              <Select value={editingWallet?.currency || baseCurrency} disabled>
+                <SelectTrigger className="w-full px-3 py-2 bg-bg-input border border-border-main rounded-lg text-text-primary placeholder:text-text-muted focus:outline-none focus:ring-2 focus:ring-blue-500 opacity-60 cursor-not-allowed">
+                  <SelectValue />
+                </SelectTrigger>
+                <SelectContent>
+                  {allCurrencyCodes.map(code => {
+                    const info = dbCurrencies.find(c => c.code === code);
+                    return (
+                      <SelectItem key={code} value={code}>{info ? `${info.symbol} ${info.code} — ${info.name}` : code}</SelectItem>
+                    );
+                  })}
+                </SelectContent>
+              </Select>
+            </div>
+          </div>
+          <DialogFooter>
+            <Button variant="outline" onClick={() => setEditingWallet(null)}>Cancel</Button>
+            <Button className="bg-transparent border-2 border-blue-600/30 text-blue-600 hover:bg-emerald-500 hover:text-white" onClick={handleUpdateWallet}>Save Changes</Button>
+          </DialogFooter>
+        </DialogContent>
+      </Dialog>
+
+      <Dialog open={categoryDialogOpen} onOpenChange={(open) => { setCategoryDialogOpen(open); if (!open) { setIsSubcategory(false); setSelectedParentId(null); setTempSubs([]); setTempSubInput(''); setNewCategoryIcon('HelpCircle'); } }}>
+        <DialogContent className="bg-white dark:bg-slate-800 border border-border-main">
+          <DialogHeader>
+            <DialogTitle className="text-text-primary">Add Category</DialogTitle>
+          </DialogHeader>
+          <div className="space-y-4 py-4">
+            <div className="space-y-2">
+              <Label className="block text-sm font-medium text-text-secondary mb-1">Category Level</Label>
+              <div className="flex gap-4">
+                <label className="flex items-center gap-2 cursor-pointer">
+                  <input type="radio" name="categoryLevel" checked={!isSubcategory} onChange={() => { setIsSubcategory(false); setSelectedParentId(null); setTempSubs([]); setTempSubInput(''); }} className="accent-blue-600" />
+                  <span className="text-sm text-text-primary">Main Category</span>
+                </label>
+                <label className="flex items-center gap-2 cursor-pointer">
+                  <input type="radio" name="categoryLevel" checked={isSubcategory} onChange={() => { setIsSubcategory(true); setTempSubs([]); setTempSubInput(''); }} className="accent-blue-600" />
+                  <span className="text-sm text-text-primary">Subcategory</span>
+                </label>
+              </div>
+            </div>
+            <div className="space-y-2">
+              <Label className="block text-sm font-medium text-text-secondary mb-1">Name</Label>
+              <Input 
+                value={newCategoryName} 
+                onChange={(e) => setNewCategoryName(e.target.value)}
+                className="w-full px-3 py-2 bg-bg-input border border-border-main rounded-lg text-text-primary placeholder:text-text-muted focus:outline-none focus:ring-2 focus:ring-blue-500"
+              />
+            </div>
+            <div className="space-y-2">
+              <Label className="block text-sm font-medium text-text-secondary mb-1">Icon Selection</Label>
+              <IconPicker 
+                selectedIcon={newCategoryIcon} 
+                onIconSelect={setNewCategoryIcon}
+                className="w-full"
+              />
+            </div>
+            {isSubcategory && (
+              <>
+                <div className="space-y-2">
+                  <Label className="block text-sm font-medium text-text-secondary mb-1">Parent Category</Label>
+                  <Select value={selectedParentId?.toString() || ''} onValueChange={(v) => setSelectedParentId(parseInt(v))}>
+                    <SelectTrigger className="w-full px-3 py-2 bg-bg-input border border-border-main rounded-lg text-text-primary placeholder:text-text-muted focus:outline-none focus:ring-2 focus:ring-blue-500">
+                      <SelectValue placeholder="Select a parent category..." />
+                    </SelectTrigger>
+                    <SelectContent>
+                      {categories.filter(c => c.parent_id == null && c.name !== 'Savings Transfer').map(cat => (
+                        <SelectItem key={cat.id} value={cat.id!.toString()}>
+                          <div className="flex items-center gap-2">
+                            <CategoryIcon name={cat.icon || 'Circle'} className="w-4 h-4" />
+                            {cat.name}
+                          </div>
+                        </SelectItem>
+                      ))}
+                    </SelectContent>
+                  </Select>
+                </div>
+                <div className="space-y-2">
+                  <Label className="block text-sm font-medium text-text-secondary mb-1">Subcategory Icon (Optional)</Label>
+                  <div className="flex items-center gap-2">
+                    <div className="flex items-center gap-2 flex-1">
+                      <CategoryIcon name={newCategoryIcon} className="w-5 h-5" />
+                      <span className="text-sm text-text-secondary">{newCategoryIcon}</span>
+                    </div>
+                    <Button
+                      type="button"
+                      variant="outline"
+                      size="sm"
+                      onClick={() => setShowIconPicker(!showIconPicker)}
+                      className="px-3 py-2"
+                    >
+                      Change Icon
+                    </Button>
+                  </div>
+                  {showIconPicker && (
+                    <div className="mt-2 p-3 bg-slate-50 dark:bg-slate-700/50 border border-border-main rounded-lg">
+                      <IconPicker 
+                        selectedIcon={newCategoryIcon} 
+                        onIconSelect={setNewCategoryIcon}
+                        className="w-full"
+                      />
+                    </div>
+                  )}
+                  <p className="text-xs text-text-muted">Leave empty to use parent category's icon</p>
+                </div>
+              </>
+            )}
+            <div className="space-y-2">
+              <Label className="block text-sm font-medium text-text-secondary mb-1">Type</Label>
+              <Select value={newCategoryType} onValueChange={(v) => setNewCategoryType(v as any)}>
+                <SelectTrigger className="w-full px-3 py-2 bg-bg-input border border-border-main rounded-lg text-text-primary placeholder:text-text-muted focus:outline-none focus:ring-2 focus:ring-blue-500">
+                  <SelectValue />
+                </SelectTrigger>
+                <SelectContent>
+                  <SelectItem value="expense">Expense</SelectItem>
+                  <SelectItem value="income">Income</SelectItem>
+                  <SelectItem value="both">Both</SelectItem>
+                </SelectContent>
+              </Select>
+            </div>
+            {!isSubcategory && (
+              <div className="space-y-2 border-t border-border-main pt-3">
+                <Label className="block text-sm font-medium text-text-secondary mb-1">Initial Subcategories <span className="text-text-muted text-xs">(Optional)</span></Label>
+                <div className="flex gap-2">
+                  <Input
+                    value={tempSubInput}
+                    onChange={(e) => setTempSubInput(e.target.value)}
+                    onKeyDown={(e) => { if (e.key === 'Enter') { e.preventDefault(); handleAddTempSub(); } }}
+                    placeholder="Subcategory name"
+                    className="flex-1 px-3 py-2 bg-bg-input border border-border-main rounded-lg text-text-primary placeholder:text-text-muted focus:outline-none focus:ring-2 focus:ring-blue-500"
+                  />
+                  <Button
+                    type="button"
+                    size="sm"
+                    onClick={handleAddTempSub}
+                    disabled={!tempSubInput.trim()}
+                    className="bg-blue-600 hover:bg-blue-700 text-white px-3 py-2 rounded-lg text-sm font-medium"
+                  >
+                    <Plus className="w-4 h-4 mr-1" /> Add Sub
+                  </Button>
+                </div>
+                {tempSubs.length > 0 && (
+                  <div className="flex flex-wrap gap-2 mt-2">
+                    {tempSubs.map((sub, i) => (
+                      <span key={i} className="inline-flex items-center gap-1.5 bg-blue-500/10 text-blue-700 dark:text-blue-300 border border-blue-500/20 rounded-full px-3 py-1 text-xs font-medium">
+                        {sub}
+                        <button type="button" onClick={() => handleRemoveTempSub(i)} className="hover:text-red-500 transition-colors cursor-pointer">
+                          <X className="w-3 h-3" />
+                        </button>
+                      </span>
+                    ))}
+                  </div>
+                )}
+              </div>
+            )}
+          </div>
+          <DialogFooter>
+            <Button variant="outline" onClick={() => setCategoryDialogOpen(false)}>Cancel</Button>
+            <Button className="bg-transparent border-2 border-blue-600/30 text-blue-600 hover:bg-emerald-500 hover:text-white" onClick={handleAddCategory}>Add {isSubcategory ? 'Subcategory' : 'Category'}</Button>
+          </DialogFooter>
+        </DialogContent>
+      </Dialog>
+
+      <Dialog open={!!editingCategory} onOpenChange={() => setEditingCategory(null)}>
+        <DialogContent className="bg-white dark:bg-slate-800 border border-border-main">
+          <DialogHeader>
+            <DialogTitle className="text-text-primary">Edit Category</DialogTitle>
+          </DialogHeader>
+          <div className="space-y-4 py-4">
+            <div className="space-y-2">
+              <Label className="block text-sm font-medium text-text-secondary mb-1">Category Name</Label>
+              {editingCategory != null && categories.find(c => c.id === editingCategory.id)?.parent_id != null && (subSpentMap.get(editingCategory.id) ?? 0) > 0 ? (
+                <Tooltip>
+                  <TooltipTrigger asChild>
+                    <div className="relative">
+                      <Input
+                        value={editingCategory.name}
+                        readOnly
+                        className="w-full px-3 py-2 border rounded-lg bg-neutral-100 text-neutral-400 cursor-not-allowed border-neutral-200 pr-8 focus:outline-none focus:ring-2 focus:ring-blue-500"
+                      />
+                      <Lock className="absolute right-2.5 top-1/2 -translate-y-1/2 w-3.5 h-3.5 text-neutral-400" />
+                    </div>
+                  </TooltipTrigger>
+                  <TooltipContent side="top" className="max-w-[260px] text-center">
+                    🔒 This subcategory name is locked because it contains active transaction history.
+                  </TooltipContent>
+                </Tooltip>
+              ) : (
+                <div className="relative">
+                  <Input
+                    value={editingCategory?.name || ''}
+                    onChange={(e) => setEditingCategory(editingCategory ? { ...editingCategory, name: e.target.value } : null)}
+                    className="w-full px-3 py-2 bg-bg-input border border-border-main rounded-lg text-text-primary placeholder:text-text-muted focus:outline-none focus:ring-2 focus:ring-blue-500"
+                  />
+                </div>
+              )}
+            </div>
+            {editingCategory && categories.find(c => c.id === editingCategory.id)?.parent_id != null ? (
+              <div className="space-y-2">
+                <Label className="block text-sm font-medium text-text-secondary mb-1">Budget</Label>
+                <p className="text-xs text-text-muted italic">Inherits Parent Budget</p>
+              </div>
+            ) : (
+              <div className="space-y-2">
+                <Label className="block text-sm font-medium text-text-secondary mb-1">Type</Label>
+                <Select value={editingCategory?.type || 'expense'} onValueChange={(v) => setEditingCategory(editingCategory ? { ...editingCategory, type: v } : null)}>
+                  <SelectTrigger className="w-full px-3 py-2 bg-bg-input border border-border-main rounded-lg text-text-primary placeholder:text-text-muted focus:outline-none focus:ring-2 focus:ring-blue-500">
+                    <SelectValue />
+                  </SelectTrigger>
+                  <SelectContent>
+                    <SelectItem value="expense">Expense</SelectItem>
+                    <SelectItem value="income">Income</SelectItem>
+                    <SelectItem value="both">Both</SelectItem>
+                  </SelectContent>
+                </Select>
+              </div>
+            )}
+          </div>
+          <DialogFooter>
+            <Button variant="outline" onClick={() => setEditingCategory(null)}>Cancel</Button>
+            <Button
+              disabled={editingCategory != null && categories.find(c => c.id === editingCategory.id)?.parent_id != null && (subSpentMap.get(editingCategory.id) ?? 0) > 0}
+              onClick={handleUpdateCategory}
+              className={`transition-colors ${editingCategory != null && categories.find(c => c.id === editingCategory.id)?.parent_id != null && (subSpentMap.get(editingCategory.id) ?? 0) > 0 ? 'opacity-40 cursor-not-allowed bg-gray-100 text-gray-400' : 'bg-transparent border-2 border-blue-600/30 text-blue-600 hover:bg-emerald-500 hover:text-white'}`}
+            >
+              Save Changes
+            </Button>
+          </DialogFooter>
+      </DialogContent>
+    </Dialog>
+
+      {/* MANAGE SAVINGS GOALS — Full-Width Header Card with [+ New Goal] */}
+            <div id="manage-savings-goals-section" className="bg-card border border-border-main rounded-xl shadow-sm p-6 w-full">
+              <div className="flex items-center justify-between mb-4">
+                <div>
+                  <h3 className="text-sm font-bold tracking-tight text-text-primary flex items-center gap-2">🎯 Manage Savings Goals</h3>
+                  <p className="text-[11px] text-text-muted">Track long-term financial targets and automated surplus sweeps.</p>
+                </div>
+                <button
+                  onClick={() => { setSelectedIcon('🎯'); setEditingGoalId(null); setGoalName(''); setTargetAmount(''); setTargetDate('');                     setIsAutoDepositToggledOn(false);
+                    setGoalAllocationRatio(0);
+                    setFormError(null); setIsModalOpen(true); }}
+                  disabled={isMaxLimitReached}
+                  className={
+                    isMaxLimitReached
+                      ? "bg-gray-200 text-gray-400 cursor-not-allowed border border-gray-300 shadow-none font-bold text-xs py-2 px-4 rounded-xl"
+                      : "border-2 border-blue-600/30 text-blue-600 hover:bg-emerald-500 hover:text-white font-bold text-xs py-2 px-4 rounded-xl transition shadow-sm cursor-pointer"
+                  }
+                >
+                  {isMaxLimitReached ? 'Goal Limit Reached (Max 5)' : '+ New Goal'}
+                </button>
+              </div>
+
+              {goals.length === 0 ? (
+                <div className="py-8 text-center text-text-muted text-xs">
+                  No savings goals configured yet. Create your first goal above.
+                </div>
+              ) : (
+                <div className="flex-1 overflow-y-auto max-h-[220px] pr-1 scrollbar-thin scrollbar-thumb-zinc-800 scrollbar-track-transparent [&::-webkit-scrollbar]:w-1.5 [&::-webkit-scrollbar-thumb]:bg-zinc-800 [&::-webkit-scrollbar-thumb]:rounded-full hover:[&::-webkit-scrollbar-thumb]:bg-zinc-700">
+                  {goals.map(goal => (
+                    <div key={goal.id} className="flex items-center justify-between p-3.5 bg-slate-50 dark:bg-slate-700/50 border border-border-main rounded-xl mb-2.5 last:mb-0 w-full">
+                      <div className="flex items-center gap-3 min-w-0 flex-1">
+                        <span className="text-text-primary font-bold text-sm">{goal.name}</span>
+                      </div>
+                      <span className="text-xs font-semibold text-blue-600 mx-3 shrink-0">
+                        Target: {formatMoney(goal.target_amount, baseCurrency)}
+                      </span>
+                      <div className="flex items-center gap-3 shrink-0">
+                        <button
+                          onClick={() => handleEditClick(goal)}
+                          className="text-text-muted hover:text-text-primary transition cursor-pointer text-sm"
+                        >
+                          ✏️
+                        </button>
+                        <button
+                          onClick={async () => {
+                            setTargetGoalId(goal.id!);
+                            setPendingDeleteGoal(goal);
+                            setIsDeleteOpen(true);
+                            setDeletePreviewLoading(true);
+                            setShowDeleteDetails(false);
+                            try {
+                              const preview = await findGoalRelatedEntries(goal.id!);
+                              setDeletePreview(preview);
+                            } catch {
+                              setDeletePreview({ transfers: [], expenses: [], auditLogs: [] });
+                            } finally {
+                              setDeletePreviewLoading(false);
+                            }
+                          }}
+                          className="text-red-400 hover:text-red-300 transition cursor-pointer text-sm"
+                        >
+                          🗑️
+                        </button>
+                      </div>
+                    </div>
+                  ))}
+                </div>
+              )}
+            </div>
+
+            {/* CREATE/EDIT SAVINGS GOAL MODAL */}
+            {isModalOpen && (() => {
+              const currentEditingGoal = editingGoalId ? goals.find(g => g.id === editingGoalId) || null : null;
+              const isGoalFulfilled = currentEditingGoal ? (currentEditingGoal.current_amount >= currentEditingGoal.target_amount) : false;
+              return (
+              <div className="fixed inset-0 bg-black/75 backdrop-blur-sm z-50 flex items-center justify-center p-4">
+                <div className="bg-white dark:bg-slate-800 border border-border-main rounded-2xl p-6 w-full max-w-lg shadow-2xl">
+                  <div className="flex items-center justify-between mb-5">
+                    <h3 className="text-sm font-bold tracking-tight text-text-primary">
+                      {editingGoalId ? '✏️ Edit Savings Goal' : '🎯 New Savings Goal'}
+                    </h3>
+                    <button onClick={() => { setFormError(null); setIsModalOpen(false); }} className="text-text-muted hover:text-text-primary transition text-xl leading-none cursor-pointer">×</button>
+                  </div>
+                  {isGoalFulfilled && (
+                    <div className="bg-amber-50 dark:bg-amber-950/30 border-l-4 border-amber-500 p-3 rounded-r-md mb-4">
+                      <p className="text-xs text-amber-700 dark:text-amber-300 font-medium">
+                        🔒 <strong>Fully Funded Goal Locked:</strong> This savings goal has reached 100% completion. Targets and sweep allocation ratios cannot be altered until this goal is spent or reallocated.
+                      </p>
+                    </div>
+                  )}
+                  {formError && (
+                    <div className="mb-4 p-3 bg-rose-500/10 border border-rose-500/20 rounded-xl flex items-center gap-2.5 animate-shake">
+                      <span className="text-xs text-rose-500">⚠️</span>
+                      <p className="text-[11px] font-semibold text-rose-400 leading-tight text-left">{formError}</p>
+                    </div>
+                  )}
+                  <form onSubmit={async (e) => {
+                    e.preventDefault();
+                    const formData = new FormData(e.currentTarget);
+                    const rawInputFieldValue = (formData.get('name') as string || '').trim();
+                    const bareAlphabeticalWords = rawInputFieldValue.replace(/^([\u2300-\u27BF]|[\uE000-\uF8FF]|\uD83C[\uDC00-\uDFFF]|\uD83D[\uDC00-\uDFFF]|[\u2011-\u26FF]|\uD83E[\uDC00-\uDFFF])\uFE0F?\s*/, '').trim();
+                    if (bareAlphabeticalWords.length === 0) {
+                      setFormError('Goal Name cannot be left blank! Please type a description title for your target.');
+                      return;
+                    }
+                    const cleanWords = rawInputFieldValue.replace(/^([\u2300-\u27BF]|[\uE000-\uF8FF]|\uD83C[\uDC00-\uDFFF]|\uD83D[\uDC00-\uDFFF]|[\u2011-\u26FF]|\uD83E[\uDC00-\uDFFF])\uFE0F?\s*/, '').trim();
+                    const uniqueGoalTitleString = `${selectedIcon} ${cleanWords}`;
+                    if (!targetDate) { setFormError('Target date is required! Please select a valid deadline.'); return; }
+
+                    const isDuplicate = await db.savings_goals
+                      .where('name')
+                      .equalsIgnoreCase(uniqueGoalTitleString)
+                      .first();
+
+                    if (editingGoalId) {
+                      if (isDuplicate && isDuplicate.id !== editingGoalId) {
+                        setFormError("A savings goal with this name already exists! Please use a unique title.");
+                        return;
+                      }
+                    } else {
+                      if (isDuplicate) {
+                        setFormError("A savings goal with this name already exists! Please use a unique title.");
+                        return;
+                      }
+                    }
+
+                    const scanText = `${goalName || ''} ${selectedIcon || ''}`.toUpperCase();
+
+                    let systemCategory = 'Fixed Assets';
+                    let systemSubcategory = 'Asset Acquisition';
+
+                    if (/\b(COW|GOAT|FARM)\b/.test(scanText) || scanText.includes('🐄') || scanText.includes('🐐')) {
+                      systemCategory = 'Fixed Assets';
+                      systemSubcategory = 'Livestock & Agriculture';
+                    } else if (/\b(CAR|BIKE|TRUCK)\b/.test(scanText) || scanText.includes('🚗') || scanText.includes('🚲')) {
+                      systemCategory = 'Fixed Assets';
+                      systemSubcategory = 'Vehicle Purchase';
+                    } else if (/\b(HOME|HOUSE|LAND|PLOT)\b/.test(scanText) || scanText.includes('🏠')) {
+                      systemCategory = 'Fixed Assets';
+                      systemSubcategory = 'Property Acquisition';
+                    } else if (/\b(LAPTOP|IPHONE|PC|TECH)\b/.test(scanText) || scanText.includes('💻')) {
+                      systemCategory = 'Personal Electronics';
+                      systemSubcategory = 'Gadgets & Tech Gear';
+                    } else if (/\b(BIZ|STOCKS|INVEST|GOLD)\b/.test(scanText) || scanText.includes('🚀') || scanText.includes('📈')) {
+                      systemCategory = 'Investments';
+                      systemSubcategory = 'Business & Capital';
+                    } else if (/\b(WEDDING|SHAADI|EVENT|GIFT)\b/.test(scanText) || scanText.includes('💍')) {
+                      systemCategory = 'Life Milestones';
+                      systemSubcategory = 'Special Events';
+                    } else if (/\b(TRIP|VACATION|SWAT|TOUR)\b/.test(scanText) || scanText.includes('✈️') || scanText.includes('🌴')) {
+                      systemCategory = 'Travel & Vacation';
+                      systemSubcategory = 'Holiday Disbursal';
+                    } else if (/\b(FEES|COLLEGE|BOOK|STUDY)\b/.test(scanText) || scanText.includes('🎓')) {
+                      systemCategory = 'Education';
+                      systemSubcategory = 'Tuition & Training';
+                    } else if (/\b(EMERGENCY|SHIELD|MEDICAL)\b/.test(scanText) || scanText.includes('🚨') || scanText.includes('🛡️')) {
+                      systemCategory = 'Emergency Reserves';
+                      systemSubcategory = 'Contingency Fund';
+                    }
+
+                    if (!editingGoalId) {
+                      const existingCount = await db.savings_goals.count();
+                      if (existingCount >= 5) {
+                        setFormError('❌ Maximum goal limit reached. You can only have up to 5 active savings goals at a time.');
+                        return;
+                      }
+
+                      const allGoals = await db.savings_goals.toArray();
+                      const existingRatioSum = allGoals.reduce((sum, g) => sum + (g.sweep_ratio ?? g.allocation_ratio ?? 0), 0);
+                      const newRatio = goalAllocationRatio ?? 0;
+                      const totalRatio = existingRatioSum + newRatio;
+
+                      if (totalRatio > 100) {
+                        setFormError('❌ Percentage overflow. Your total combined goals cannot exceed 100% of your available surplus pool.');
+                        return;
+                      }
+                    }
+
+                    await db.transaction('rw', [db.savings_goals, db.wallets, db.expenses], async () => {
+                        const rawBaseDollars = Math.abs(parseFloat(targetAmount) || 0);
+                         const safeTarget = Math.round(rawBaseDollars * 100);
+
+                      const updatedFields = {
+                        name: uniqueGoalTitleString,
+                        target_amount: safeTarget,
+                        target_date: targetDate,
+                        auto_deposit_surplus: isAutoDepositToggledOn,
+                        allocation_ratio: goalAllocationRatio,
+                        sweep_ratio: goalAllocationRatio,
+                        system_category: systemCategory,
+                        system_subcategory: systemSubcategory,
+                      };
+
+                      if (editingGoalId) {
+                        await db.savings_goals.update(editingGoalId, updatedFields);
+                      } else {
+                        await db.savings_goals.add({ ...updatedFields, current_amount: 0, created_at: new Date().toISOString() });
+                      }
+                    });
+
+                    await fetchGoals();
+                    setFormError(null);
+                    setIsModalOpen(false);
+                  }} className="space-y-4">
+                    <div>
+                      <label className="block text-[10px] font-bold text-text-muted uppercase mb-2">Goal Icon</label>
+                      <div className="flex gap-3">
+                        {['🎯', '🚗', '🎓', '🏠', '✈️', '🐄'].map(emoji => (
+                          <button
+                            key={emoji}
+                            type="button"
+                        onClick={() => {
+                          if (isGoalFulfilled) return;
+                          setSelectedIcon(emoji);
+                          const rawText = goalName.replace(/^([\u2300-\u27BF]|[\uE000-\uF8FF]|\uD83C[\uDC00-\uDFFF]|\uD83D[\uDC00-\uDFFF]|[\u2011-\u26FF]|\uD83E[\uDC00-\uDFFF])\uFE0F?\s*/, '');
+                          setGoalName(`${emoji} ${rawText}`);
+                        }}
+                        disabled={isGoalFulfilled}
+                        className={`w-10 h-10 rounded-full flex items-center justify-center text-lg transition-transform duration-150 ${isGoalFulfilled ? 'opacity-40 cursor-not-allowed' : 'cursor-pointer'} ${selectedIcon === emoji ? 'bg-[#2563EB] scale-110 border-2 border-white/20' : 'bg-bg-input border border-border-main hover:border-zinc-500'}`}
+                          >
+                            {emoji}
+                          </button>
+                        ))}
+                      </div>
+                    </div>
+                    <div>
+                      <label className="block text-[10px] font-bold text-text-muted uppercase mb-1.5">Goal Name</label>
+                      <input
+                        type="text"
+                        name="name"
+                        required
+                        minLength={1}
+                        value={goalName}
+                        disabled={isGoalFulfilled}
+                        className={`bg-bg-input border border-border-main rounded-xl text-xs w-full px-3 py-2 focus:outline-none ${isGoalFulfilled ? 'bg-gray-100 dark:bg-gray-800/50 text-gray-400 dark:text-gray-500 cursor-not-allowed border-gray-200 dark:border-gray-700' : 'text-text-primary focus:border-[#2563EB]'}`}
+                        placeholder="e.g., Car Fund"
+                        onChange={(e) => {
+                          const val = e.target.value;
+                          const textPart = val.replace(/^([\u2300-\u27BF]|[\uE000-\uF8FF]|\uD83C[\uDC00-\uDFFF]|\uD83D[\uDC00-\uDFFF]|[\u2011-\u26FF]|\uD83E[\uDC00-\uDFFF])\uFE0F?\s*/, '');
+                          const lowerText = textPart.toLowerCase();
+                          let detected = '🎯';
+                          for (const [kw, icon] of Object.entries(GLOBAL_EMOJI_KEYWORDS)) {
+                            if (lowerText.includes(kw)) { detected = icon; break; }
+                          }
+                          setSelectedIcon(detected);
+                          setGoalName(`${detected} ${textPart}`);
+                        }}
+                      />
+                    </div>
+            <div className="grid grid-cols-2 gap-4">
+                      <div>
+                        <label className="block text-[10px] font-bold text-text-muted uppercase mb-1.5">Target Amount</label>
+                        <div className="relative">
+                          <span className="absolute left-3 top-1/2 -translate-y-1/2 text-text-muted text-xs">{currencySymbol}</span>
+                          <input type="number" name="goalTarget" required min="1" value={targetAmount} onChange={e => setTargetAmount(e.target.value)} disabled={isGoalFulfilled} className={`bg-bg-input border border-border-main rounded-xl text-xs w-full pl-9 pr-3 py-2 focus:outline-none ${isGoalFulfilled ? 'bg-gray-100 dark:bg-gray-800/50 text-gray-400 dark:text-gray-500 cursor-not-allowed border-gray-200 dark:border-gray-700' : 'text-text-primary focus:border-[#2563EB]'}`} placeholder="0.00" />
+                        </div>
+                      </div>
+                      <div>
+                        <label className="block text-[10px] font-bold text-text-muted uppercase mb-1.5">Target Date</label>
+                        <input type="date" name="goalDate" required value={targetDate} onChange={e => setTargetDate(e.target.value)} disabled={isGoalFulfilled} className={`bg-bg-input border border-border-main rounded-xl text-xs w-full px-3 py-2 focus:outline-none ${isGoalFulfilled ? 'bg-gray-100 dark:bg-gray-800/50 text-gray-400 dark:text-gray-500 cursor-not-allowed border-gray-200 dark:border-gray-700' : 'text-text-primary focus:border-[#2563EB]'}`} />
+                      </div>
+                    </div>
+                      <div className="bg-slate-50 dark:bg-slate-700/50 border border-border-main rounded-xl p-3 flex items-center justify-between">
+                       <span className="text-xs text-text-secondary">Auto-Deposit Leftover Surplus</span>
+                       <button
+                         type="button"
+                         onClick={() => { if (isGoalFulfilled) return; setIsAutoDepositToggledOn(!isAutoDepositToggledOn); }}
+                         disabled={isGoalFulfilled}
+                         className={`relative w-9 h-5 rounded-full transition-colors after:content-[''] after:absolute after:top-0.5 after:left-0.5 after:bg-white after:rounded-full after:h-4 after:w-4 after:transition-all ${isGoalFulfilled ? 'opacity-40 cursor-not-allowed' : ''} ${isAutoDepositToggledOn ? 'bg-emerald-500 after:translate-x-4' : 'bg-zinc-300 dark:bg-zinc-700'}`}
+                       />
+                     </div>
+                       <div className="bg-slate-50 dark:bg-slate-700/50 border border-border-main rounded-xl p-3">
+                        <div className="flex items-center justify-between mb-2">
+                          <span className="text-xs text-text-secondary">Allocation Ratio</span>
+                          <span className="text-xs font-bold text-text-primary">{goalAllocationRatio}%</span>
+                        </div>
+                        <div className="flex items-center gap-4">
+                          <input
+                            type="range"
+                            min="0"
+                            max="100"
+                            step="1"
+                            value={goalAllocationRatio}
+                            onChange={e => setGoalAllocationRatio(Number(e.target.value))}
+                            disabled={isGoalFulfilled}
+                            className={`flex-1 h-1.5 rounded-full appearance-none ${isGoalFulfilled ? 'bg-gray-200 dark:bg-gray-700 cursor-not-allowed' : 'bg-zinc-300 dark:bg-zinc-700 cursor-pointer accent-blue-600'}`}
+                          />
+                          <div className="flex items-center gap-1 shrink-0">
+                            <input
+                              type="number"
+                              min="0"
+                              max="100"
+                              value={goalAllocationRatio}
+                              onChange={e => setGoalAllocationRatio(Math.min(100, Math.max(0, Number(e.target.value) || 0)))}
+                              disabled={isGoalFulfilled}
+                              className={`w-14 border rounded-lg px-2 py-1 text-xs font-bold text-center focus:outline-none ${isGoalFulfilled ? 'bg-gray-100 dark:bg-gray-800/50 text-gray-400 dark:text-gray-500 cursor-not-allowed border-gray-200 dark:border-gray-700' : 'bg-white dark:bg-slate-800 border-border-main text-text-primary focus:border-blue-500'}`}
+                            />
+                            <span className="text-xs font-bold text-text-muted">%</span>
+                          </div>
+                        </div>
+                        <p className="text-[10px] text-text-muted mt-2">🎯 Shared Allocation Priority (% of Savings Pool)</p>
+                      </div>
+                    <div className="flex justify-end gap-3 pt-2">
+                      <button type="button" onClick={() => { setFormError(null); setIsModalOpen(false); }} className="text-xs font-semibold text-text-muted bg-bg-input hover:bg-zinc-200 dark:hover:bg-zinc-700 rounded-lg px-4 py-2 transition cursor-pointer">Cancel</button>
+                        <button type="submit" disabled={isGoalFulfilled} className={`text-xs font-semibold rounded-lg px-4 py-2 transition ${isGoalFulfilled ? 'bg-gray-100 dark:bg-gray-800/50 text-gray-400 dark:text-gray-500 border-2 border-gray-200 dark:border-gray-700 cursor-not-allowed' : 'border-2 border-blue-600/30 text-blue-600 hover:bg-emerald-500 hover:text-white cursor-pointer'}`}>Save Goal</button>
+                    </div>
+                  </form>
+                </div>
+              </div>
+              );})()}
+
+            {/* DELETE CONFIRMATION MODAL — shows related entries that will be purged */}
+            {isDeleteOpen && (
+              <div className="fixed inset-0 bg-black/80 backdrop-blur-sm flex items-center justify-center p-4 z-50">
+                <div className="w-full max-w-md max-h-[85vh] overflow-y-auto bg-white dark:bg-slate-800 border border-border-main rounded-2xl p-6 shadow-2xl text-center">
+                  <div className="text-xl mb-2">�️</div>
+                  <h4 className="text-sm font-bold text-text-primary mb-1.5">Delete Savings Goal?</h4>
+
+                  {deletePreviewLoading ? (
+                    <p className="text-[11px] text-text-muted leading-relaxed mb-5">Scanning related entries...</p>
+                  ) : deletePreview ? (
+                    <div className="mb-5 text-left space-y-3">
+                      {
+                        !pendingDeleteGoal ? null : (() => {
+                          const g = pendingDeleteGoal;
+                          const isComplete = (g.current_amount || 0) >= (g.target_amount || 0);
+                          const balance = g.current_amount || 0;
+                          const pct = Math.min(100, Math.round((g.current_amount || 0) / Math.max(1, g.target_amount || 1) * 100));
+                          return (
+                            <div className="text-left">
+                              <div className="flex items-center gap-2 mb-1">
+                                <span className="text-[10px] px-2 py-0.5 rounded-full font-bold" style={{ background: isComplete ? "#064e3b" : "#fbbf24", color: isComplete ? "#6ee7b7" : "#78350f" }}>
+                                  {pct}%
+                                </span>
+                                <span className="text-[11px] text-text-secondary font-bold">{isComplete ? "COMPLETE" : "INCOMPLETE"}</span>
+                              </div>
+                              <div className="text-[11px] text-text-muted leading-relaxed">
+                                {balance > 0 && !isComplete && <span>Current saved: <strong>{formatMoney(g.current_amount, baseCurrency)}</strong> will be refunded to wallet.<br/></span>}
+                                {balance > 0 && isComplete && <span>Goal completed. <strong>{formatMoney(g.current_amount, baseCurrency)}</strong> refund conditional on wallet coverage.<br/></span>}
+                                {balance <= 0 && <span>No balance to refund.<br/></span>}
+                                All linked transfers and expenses will be removed and logged as voided.
+                              </div>
+                            </div>
+                          );
+                        })()
+                      }
+
+                      <div className="flex flex-wrap gap-2 justify-center">
+                        {deletePreview.transfers.length > 0 && (
+                          <span className="text-[10px] font-bold px-2.5 py-1 rounded-full bg-blue-500/15 text-blue-400 border border-blue-500/30">
+                            {deletePreview.transfers.length} Transfer{deletePreview.transfers.length !== 1 ? 's' : ''}
+                          </span>
+                        )}
+                        {deletePreview.expenses.length > 0 && (
+                          <span className="text-[10px] font-bold px-2.5 py-1 rounded-full bg-amber-500/15 text-amber-400 border border-amber-500/30">
+                            {deletePreview.expenses.length} Expense{deletePreview.expenses.length !== 1 ? 's' : ''}
+                          </span>
+                        )}
+                        {deletePreview.auditLogs.length > 0 && (
+                          <span className="text-[10px] font-bold px-2.5 py-1 rounded-full bg-violet-500/15 text-violet-400 border border-violet-500/30">
+                            {deletePreview.auditLogs.length} Audit Entr{deletePreview.auditLogs.length !== 1 ? 'ies' : 'y'}
+                          </span>
+                        )}
+                        {deletePreview.transfers.length === 0 && deletePreview.expenses.length === 0 && deletePreview.auditLogs.length === 0 && (
+                          <span className="text-[10px] font-bold px-2.5 py-1 rounded-full bg-emerald-500/15 text-emerald-400 border border-emerald-500/30">
+                            No related entries found
+                          </span>
+                        )}
+                      </div>
+
+                      {(deletePreview.transfers.length > 0 || deletePreview.expenses.length > 0 || deletePreview.auditLogs.length > 0) && (
+                        <button
+                          type="button"
+                          onClick={() => setShowDeleteDetails(s => !s)}
+                          className="text-[10px] text-blue-400 font-bold uppercase tracking-wider cursor-pointer hover:underline"
+                        >
+                          {showDeleteDetails ? "Hide details ▲" : "Show details ▼"}
+                        </button>
+                      )}
+
+                      {showDeleteDetails && (
+                        <div className="mt-2 max-h-40 overflow-y-auto border border-border-main rounded-lg divide-y divide-border-main">
+                          {deletePreview.transfers.map((t, i) => (
+                            <div key={"t" + i} className="px-3 py-1.5 text-[10px] text-text-secondary flex justify-between gap-2">
+                              <span className="truncate">Transfer: {(t.description || "(no description)").replace(/(\d+) cents to /g, (_, c) => formatMoney(parseInt(c), baseCurrency) + ' to ')}</span>
+                              <span className="text-text-muted font-mono tabular-nums">{formatMoney(t.amount, baseCurrency)}</span>
+                            </div>
+                          ))}
+                          {deletePreview.expenses.map((e, i) => (
+                            <div key={"e" + i} className="px-3 py-1.5 text-[10px] text-text-secondary flex justify-between gap-2">
+                              <span className="truncate">[{e.category}] {(e.description || "(no description)").replace(/(\d+) cents to /g, (_, c) => formatMoney(parseInt(c), baseCurrency) + ' to ')}</span>
+                              <span className="text-text-muted font-mono tabular-nums">{formatMoney(e.amount, baseCurrency)}</span>
+                            </div>
+                          ))}
+                          {deletePreview.auditLogs.map((a, i) => (
+                            <div key={"a" + i} className="px-3 py-1.5 text-[10px] text-text-muted flex justify-between gap-2 italic">
+                              <span className="truncate">Audit: {(a.original_description || "(no description)").replace(/(\d+) cents to /g, (_, c) => formatMoney(parseInt(c), baseCurrency) + ' to ')}</span>
+                              <span className="font-mono">{formatMoney(Math.abs(Number(a.original_amount || 0)), baseCurrency)}</span>
+                            </div>
+                          ))}
+                        </div>
+                      )}
+                    </div>
+                  ) : null}
+
+                  <div className="flex gap-3 pt-3 border-t border-border-main">
+                    <button
+                      onClick={() => {
+                        setIsDeleteOpen(false);
+                        setDeletePreview(null);
+                        setPendingDeleteGoal(null);
+                        setShowDeleteDetails(false);
+                      }}
+                      className="flex-1 bg-bg-input hover:bg-zinc-200 dark:hover:bg-zinc-700 text-text-secondary font-semibold text-xs py-2.5 rounded-xl transition border border-border-main cursor-pointer"
+                    >
+                      Cancel
+                    </button>
+                    <button
+                      onClick={async () => {
+                        if (targetGoalId !== null) {
+                          await executeSafeGoalDeletion(targetGoalId);
+                        }
+                        setIsDeleteOpen(false);
+                        setDeletePreview(null);
+                        setPendingDeleteGoal(null);
+                        setShowDeleteDetails(false);
+                        await fetchGoals();
+                      }}
+                      className="flex-1 bg-rose-600 hover:bg-rose-500 text-white font-bold text-xs py-2.5 rounded-xl transition shadow-lg shadow-rose-600/10 cursor-pointer"
+                    >
+                      Delete Goal
+                    </button>
+                  </div>
+                </div>
+              </div>
+            )}
+
+      {/* Settings Sub-Controls Grid Row */}
+      <div className="grid grid-cols-1 xl:grid-cols-2 gap-6 items-stretch w-full">
+
+        {/* Notifications Settings */}
+        <div id="notifications-section" className="bg-card border border-border-main rounded-xl shadow-sm p-6 flex flex-col justify-between">
+          <div>
+            <h3 className="font-semibold text-text-primary mb-4">Notifications</h3>
+            <div className="flex flex-col gap-4">
+              <div className="flex justify-between items-center">
+                <div>
+                  <p className="text-sm font-medium text-text-primary">Budget Alerts</p>
+                  <p className="text-xs text-text-muted">Get notified when you exceed your budget</p>
+                </div>
+                <Switch checked={allowBudgetAlerts} onCheckedChange={setAllowBudgetAlerts} />
+              </div>
+            </div>
+          </div>
+        </div>
+
+        {/* Data & Storage Management */}
+        <div className="bg-card border border-border-main rounded-xl shadow-sm p-6 flex flex-col justify-between">
+          <div>
+            <h3 className="font-semibold text-text-primary mb-2">Data & Storage Management</h3>
+            <p className="text-xs text-text-muted mb-4">
+              Securely download hard copies of your financial data ledger or restore an encrypted configuration backup file.
+            </p>
+            <div className="flex flex-col sm:flex-row gap-3 w-full">
+              <div className="relative group w-full">
+                <button
+                  onClick={handleBackupDatabase}
+                  className="w-full border-2 border-blue-600/30 hover:bg-emerald-500 hover:text-white text-blue-600 font-medium text-sm py-3 px-5 rounded-lg transition-colors text-center cursor-pointer"
+                >
+                  📥 Data Backup
+                </button>
+                <div className="absolute bottom-full left-1/2 -translate-x-1/2 mb-2 hidden group-hover:block z-10">
+                  <div className="bg-emerald-500 text-white text-[11px] font-medium px-3 py-1.5 rounded-md whitespace-nowrap shadow-lg">
+                    Full backup of all your data
+                    <div className="absolute top-full left-1/2 -translate-x-1/2 w-0 h-0 border-l-4 border-r-4 border-t-4 border-transparent border-t-emerald-500"></div>
+                  </div>
+                </div>
+              </div>
+              <div className="relative group w-full">
+                <label className="w-full flex items-center justify-center cursor-pointer border-2 border-blue-600/30 hover:bg-emerald-500 hover:text-white text-blue-600 font-medium text-sm py-3 px-5 rounded-lg transition-colors text-center">
+                  📤 Data Restore
+                  <input
+                    type="file"
+                    accept=".json"
+                    onChange={handleFileSelected}
+                    className="hidden"
+                  />
+                </label>
+                <div className="absolute bottom-full left-1/2 -translate-x-1/2 mb-2 hidden group-hover:block z-10">
+                  <div className="bg-emerald-500 text-white text-[11px] font-medium px-3 py-1.5 rounded-md whitespace-nowrap shadow-lg">
+                    Restore data from a previously backup
+                    <div className="absolute top-full left-1/2 -translate-x-1/2 w-0 h-0 border-l-4 border-r-4 border-t-4 border-transparent border-t-emerald-500"></div>
+                  </div>
+                </div>
+              </div>
+            </div>
+          </div>
+          <div className="mt-4 pt-4 border-t border-border-main flex justify-end gap-3">
+            <button
+              onClick={handleRestoreDefaultCategories}
+              className="bg-blue-500/10 hover:bg-blue-500 text-blue-500 hover:text-white font-semibold text-xs py-2 px-4 rounded-lg border border-blue-500/20 transition-colors duration-150 cursor-pointer"
+            >
+              ↩️ Restore Default Categories
+            </button>
+            <button
+              onClick={handleResetData}
+              className="bg-red-500/10 hover:bg-red-500 text-red-500 hover:text-white font-semibold text-xs py-2 px-4 rounded-lg border border-red-500/20 transition-colors duration-150 cursor-pointer"
+            >
+              ⚠️ Reset Entire App Data Slate
+            </button>
+          </div>
+        </div>
+      </div>
+
+      {/* Restore Confirmation Dialog */}
+      <Dialog open={restoreDialogOpen} onOpenChange={setRestoreDialogOpen}>
+        <DialogOverlay className="bg-black/40 backdrop-blur-sm" />
+        <DialogContent className="sm:max-w-md bg-white dark:bg-slate-800 border border-border-main">
+          <DialogHeader>
+            <DialogTitle className="flex items-center gap-2 text-red-600 dark:text-red-400">
+              <AlertTriangle className="w-5 h-5" />
+              Restore Database Backup?
+            </DialogTitle>
+            <DialogDescription className="text-sm text-text-muted pt-2">
+              Warning: This action will completely overwrite all your current local wallet balances, transactions, and categories with the data from your backup file. This cannot be undone.
+            </DialogDescription>
+          </DialogHeader>
+          <DialogFooter className="flex-col sm:flex-row gap-2">
+            <Button variant="outline" onClick={handleCancelRestore}>
+              Cancel
+            </Button>
+            <Button 
+              onClick={handleConfirmRestore}
+              className="bg-orange-600 hover:bg-orange-700 text-white"
+            >
+              Confirm & Restore
+            </Button>
+          </DialogFooter>
+        </DialogContent>
+       </Dialog>
+
+      {/* Weekly Financial Summary Preview Modal */}
+      {showSummaryModal && (
+        <div className="fixed inset-0 bg-black/70 backdrop-blur-sm z-50 flex items-center justify-center p-4">
+          <div className="bg-white dark:bg-slate-800 border border-border-main rounded-xl max-w-3xl w-full max-h-[85vh] flex flex-col shadow-2xl">
+            <div className="flex items-center justify-between px-6 py-4 border-b border-border-main">
+              <h3 className="font-semibold text-lg text-text-primary">Financial Summary Preview</h3>
+              <button 
+                onClick={() => setShowSummaryModal(false)}
+                className="text-text-muted hover:text-text-primary text-xl leading-none"
+              >
+                ×
+              </button>
+            </div>
+
+            <div className="flex-1 overflow-auto p-6">
+              <pre className="font-mono text-xs bg-bg-main p-4 text-emerald-400 rounded-xl whitespace-pre-wrap border border-border-main">
+                {reportText}
+              </pre>
+            </div>
+
+            <div className="px-6 py-4 border-t border-border-main flex justify-end gap-3">
+              <Button 
+                variant="outline" 
+                onClick={() => setShowSummaryModal(false)}
+                className="bg-bg-input text-text-secondary border-border-main"
+              >
+                Close
+              </Button>
+              <Button 
+                onClick={() => downloadReportAsTxt(reportText)}
+                className="bg-transparent border-2 border-blue-600/30 text-blue-600 hover:bg-emerald-500 hover:text-white"
+              >
+                Download TXT File
+              </Button>
+            </div>
+          </div>
+        </div>
+      )}
+
+      {confirmDelete && (
+        <div className="fixed inset-0 z-50">
+          <div className="absolute inset-0 bg-black/70 backdrop-blur-sm" onClick={() => setConfirmDelete(null)} />
+          <div className="relative flex items-center justify-center h-full p-4">
+            <div className="w-full max-w-sm bg-white dark:bg-slate-800 border border-border-main rounded-2xl p-6 shadow-2xl text-center">
+              <div className="text-xl mb-2">🗑️</div>
+              <h4 className="text-sm font-bold text-text-primary mb-1.5">
+                {confirmDelete.type === 'reset' ? 'Are you absolutely sure?' : 'Delete this item?'}
+              </h4>
+              <p className="text-[11px] text-text-muted leading-relaxed mb-5">
+                {confirmDelete.type === 'wallet' && 'This will delete the wallet, but you can instantly restore it within 5 seconds using the Undo notification.'}
+                {confirmDelete.type === 'budget' && 'This will permanently delete this budget. This action cannot be undone.'}
+                {confirmDelete.type === 'reset' && 'This will permanently delete all your wallets, expenses, budgets, and transfer history. This action cannot be undone.'}
+              </p>
+              <div className="flex gap-3">
+                <button onClick={() => setConfirmDelete(null)} className="flex-1 bg-bg-input hover:bg-zinc-200 dark:hover:bg-zinc-700 text-text-secondary font-semibold text-xs py-2.5 rounded-xl transition border border-border-main cursor-pointer">
+                  Cancel
+                </button>
+                <button onClick={() => { executeDelete(); setConfirmDelete(null); }} className="flex-1 bg-rose-600 hover:bg-rose-500 text-white font-bold text-xs py-2.5 rounded-xl transition shadow-lg shadow-rose-600/10 cursor-pointer">
+                  Delete
+                </button>
+              </div>
+            </div>
+          </div>
+        </div>
+      )}
+
+    </div>
+  );
+}

@@ -1,0 +1,46 @@
+@import './tailwind.css';
+@import './theme.css';
+
+/* Critical override layout patch to drop all horizontal spacing gaps */
+html, body, #root, #root > div, main, [class*="container"], .container, .space-y-6 > div {
+  max-width: 100% !important;
+  width: 100% !important;
+  margin-left: 0 !important;
+  margin-right: 0 !important;
+  padding-left: 0 !important;
+  padding-right: 0 !important;
+}
+
+@keyframes loading {
+  0%   { transform: translateX(-100%); }
+  50%  { transform: translateX(0%); }
+  100% { transform: translateX(100%); }
+}
+
+/* Fix for date picker popup positioning */
+input[type="date"] {
+  position: relative;
+}
+
+input[type="date"]::-webkit-calendar-picker-indicator {
+  cursor: pointer;
+  position: absolute;
+  right: 8px;
+  top: 50%;
+  transform: translateY(-50%);
+  width: 20px;
+  height: 20px;
+  z-index: 10;
+}
+
+/* Try to contain the date picker popup */
+input[type="date"]::-webkit-datetime-edit {
+  padding-right: 30px;
+}
+
+/* Force date picker to appear closer to the input */
+@media (max-width: 768px) {
+  input[type="date"] {
+    font-size: 16px; /* Make tap targets larger on mobile */
+  }
+}

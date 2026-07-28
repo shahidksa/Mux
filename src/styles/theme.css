@@ -1,0 +1,124 @@
+@import "tailwindcss";
+
+/* ==========================================
+   NATIVE UTILITY DESIGN VARIABLE MATRICES
+   ========================================== */
+:root {
+  /* ☀️ LIGHT MODE */
+  --bg-color: #ffffff;
+  --text-color: #1e293b;
+  --sidebar-bg: #f8fafc;
+  --color-bg-main: #ffffff;
+  --color-bg-card: #FFFFFF;
+  --color-sidebar-bg: #f8fafc;
+  --color-border-main: rgba(228, 228, 231, 0.8);
+  --color-text-primary: #0F172A;
+  --color-text-secondary: #334155;
+  --color-text-muted: #64748B;
+  --color-bg-input: #FFFFFF;
+  --color-card-header: #E2E8F0;
+  --color-accent: #2563eb;
+  --color-accent-foreground: #ffffff;
+
+  /* shadcn/ui compatibility tokens */
+  --color-background: var(--color-bg-main);
+  --color-foreground: var(--color-text-primary);
+  --color-card: var(--color-bg-card);
+  --color-card-foreground: var(--color-text-primary);
+  --color-popover: var(--color-bg-card);
+  --color-popover-foreground: var(--color-text-primary);
+  --color-muted-foreground: var(--color-text-muted);
+  --color-border: var(--color-border-main);
+  --color-input: var(--color-border-main);
+  --color-input-background: var(--color-bg-input);
+  --color-ring: var(--color-accent);
+  --color-primary: var(--color-accent);
+  --color-primary-foreground: var(--color-accent-foreground);
+  --color-destructive: #ef4444;
+  --color-destructive-foreground: #ffffff;
+  --color-sidebar: var(--color-bg-card);
+  --color-sidebar-foreground: var(--color-text-primary);
+  --color-sidebar-accent: #e4e4e7;
+  --color-sidebar-accent-foreground: #18181b;
+
+  --popover: var(--color-popover);
+  --popover-foreground: var(--color-popover-foreground);
+  --border: var(--color-border-main);
+
+  --radius: 0.625rem;
+}
+
+:root.dark, html.dark, [data-theme="dark"] {
+  /* 🌙 DARK MODE */
+  --bg-color: #0f172a;
+  --text-color: #f8fafc;
+  --sidebar-bg: #1e293b;
+  --color-bg-main: #0f172a;
+  --color-bg-card: #1e293b;
+  --color-sidebar-bg: #1e293b;
+  --color-border-main: rgba(63, 63, 70, 0.5);
+  --color-text-primary: #f8fafc;
+  --color-text-secondary: #B0B0B8;
+  --color-text-muted: #78788A;
+  --color-bg-input: #1F2028;
+  --color-card-header: #2A2B35;
+  --color-accent: #60a5fa;
+  --color-accent-foreground: #ffffff;
+
+  --color-popover: #1F2028;
+  --popover: #1F2028;
+  --popover-foreground: var(--color-text-primary);
+  --border: var(--color-border-main);
+}
+
+/* Register theme variables into Tailwind CSS v4 design tokens */
+@theme {
+  --color-bg-main: var(--color-bg-main);
+  --color-bg-card: var(--color-bg-card);
+  --color-sidebar-bg: var(--color-sidebar-bg);
+  --color-border-main: var(--color-border-main);
+  --color-text-primary: var(--color-text-primary);
+  --color-text-secondary: var(--color-text-secondary);
+  --color-text-muted: var(--color-text-muted);
+  --color-bg-input: var(--color-bg-input);
+  --color-card-header: var(--color-card-header);
+  --color-accent: var(--color-accent);
+  --color-accent-foreground: var(--color-accent-foreground);
+
+  /* shadcn/ui compatibility token registration */
+  --color-background: var(--color-background);
+  --color-foreground: var(--color-foreground);
+  --color-card: var(--color-card);
+  --color-card-foreground: var(--color-card-foreground);
+  --color-popover: var(--color-popover);
+  --color-popover-foreground: var(--color-popover-foreground);
+  --color-muted-foreground: var(--color-muted-foreground);
+  --color-border: var(--color-border);
+  --color-input: var(--color-input);
+  --color-input-background: var(--color-input-background);
+  --color-ring: var(--color-ring);
+  --color-primary: var(--color-primary);
+  --color-primary-foreground: var(--color-primary-foreground);
+  --color-destructive: var(--color-destructive);
+  --color-destructive-foreground: var(--color-destructive-foreground);
+}
+
+/* ==========================================
+   GLOBAL VIEW BASE LAYERS HARD-BLOCK CHECKS
+   ========================================== */
+@layer base {
+  html, body {
+    background-color: var(--color-bg-main) !important;
+    color: var(--color-text-primary) !important;
+    transition: background-color 0.3s ease, color 0.3s ease;
+  }
+
+  aside {
+    transition: background-color 0.3s ease, color 0.3s ease, border-color 0.3s ease;
+  }
+
+  /* Universal card transition for smooth theme switching */
+  .bg-white, .dark\:bg-slate-800, .bg-card, .bg-bg-card {
+    transition: background-color 0.3s ease, color 0.3s ease, border-color 0.3s ease;
+  }
+} 

@@ -1,0 +1,164 @@
+@import "tailwindcss";
+
+/* ==========================================
+   NATIVE UTILITY DESIGN VARIABLE MATRICES
+   ========================================== */
+:root {
+  /* ☀️ CLEAN LIGHT MODE CORE BASELINE (Default Fallback Theme State) */
+  --color-bg-main: #F4F5F7;
+  --color-bg-card: #FFFFFF;
+  --color-border-main: rgba(228, 228, 231, 0.8);
+  --color-text-primary: #0F172A;
+  --color-text-secondary: #334155;
+  --color-text-muted: #64748B;
+  --color-bg-input: #FFFFFF;
+  --color-card-header: #E2E8F0;
+
+  /* shadcn/ui theme compatibility tokens (reference our custom tokens) */
+  --color-background: var(--color-bg-main);
+  --color-foreground: var(--color-text-primary);
+  --color-card: var(--color-bg-card);
+  --color-card-foreground: var(--color-text-primary);
+  --color-popover: var(--color-bg-card);
+  --color-popover-foreground: var(--color-text-primary);
+  --color-muted-foreground: var(--color-text-muted);
+  --color-border: var(--color-border-main);
+  --color-input: var(--color-border-main);
+  --color-input-background: var(--color-bg-input);
+  --color-ring: #3b82f6;
+  --color-primary: #3b82f6;
+  --color-primary-foreground: #ffffff;
+  --color-accent: #e4e4e7;
+  --color-accent-foreground: #18181b;
+  --color-destructive: #ef4444;
+  --color-destructive-foreground: #ffffff;
+  --color-sidebar: var(--color-bg-card);
+  --color-sidebar-foreground: var(--color-text-primary);
+  --color-sidebar-accent: #e4e4e7;
+  --color-sidebar-accent-foreground: #18181b;
+
+  /* Sonner toast compatibility — shadcn/ui expects unprefixed names */
+  --popover: var(--color-popover);
+  --popover-foreground: var(--color-popover-foreground);
+  --border: var(--color-border-main);
+
+  --radius: 0.625rem;
+}
+
+html.dark {
+  /* 🌙 COOL SLATE DARK THEME — softer, modern, easier on the eyes */
+  --color-bg-main: #161A22;
+  --color-bg-card: #1E2330;
+  --color-border-main: rgba(56, 60, 74, 0.5);
+  --color-text-primary: #EDEDF0;
+  --color-text-secondary: #B0B4C2;
+  --color-text-muted: #7A7F94;
+  --color-bg-input: #262B38;
+  --color-card-header: #2C3140;
+  --color-accent: #363B4A;
+  --color-accent-foreground: #EDEDF0;
+
+  /* Opaque popover/sheet so dropdowns aren't transparent */
+  --color-popover: #1E2330;
+  --popover: #1E2330;
+  --popover-foreground: var(--color-text-primary);
+  --border: var(--color-border-main);
+}
+
+/* Register theme variables into Tailwind CSS v4 design tokens */
+@theme {
+  --color-bg-main: var(--color-bg-main);
+  --color-bg-card: var(--color-bg-card);
+  --color-border-main: var(--color-border-main);
+  --color-text-primary: var(--color-text-primary);
+  --color-text-secondary: var(--color-text-secondary);
+  --color-text-muted: var(--color-text-muted);
+  --color-bg-input: var(--color-bg-input);
+  --color-card-header: var(--color-card-header);
+
+  /* shadcn/ui compatibility token registration */
+  --color-background: var(--color-background);
+  --color-foreground: var(--color-foreground);
+  --color-card: var(--color-card);
+  --color-card-foreground: var(--color-card-foreground);
+  --color-popover: var(--color-popover);
+  --color-popover-foreground: var(--color-popover-foreground);
+  --color-muted-foreground: var(--color-muted-foreground);
+  --color-border: var(--color-border);
+  --color-input: var(--color-input);
+  --color-input-background: var(--color-input-background);
+  --color-accent: var(--color-accent);
+  --color-accent-foreground: var(--color-accent-foreground);
+  --color-ring: var(--color-ring);
+  --color-primary: var(--color-primary);
+  --color-primary-foreground: var(--color-primary-foreground);
+  --color-destructive: var(--color-destructive);
+  --color-destructive-foreground: var(--color-destructive-foreground);
+}
+
+/* ==========================================
+   GLOBAL VIEW BASE LAYERS HARD-BLOCK CHECKS
+   ========================================== */
+@layer base {
+  body {
+    background-color: var(--color-bg-main) !important;
+    color: var(--color-text-primary) !important;
+    transition: background-color 150ms cubic-bezier(0.4, 0, 0.2, 1), color 150ms cubic-bezier(0.4, 0, 0.2, 1);
+  }
+
+  /* ⚡ THE ABSOLUTE FIX FOR INVISIBLE TEXT: 
+     Forces ALL heading elements and card layout text titles to follow fluid theme tokens */
+  h1, h2, h3, h4, span, label, p {
+    color: var(--color-text-primary);
+  }
+
+  /* Re-scoping for muted descriptor metrics text lines */
+  .text-zinc-400, .text-zinc-500, select, option {
+    color: var(--color-text-secondary) !important;
+  }
+
+  /* ⚡ THE ABSOLUTE FIX FOR INVISIBLE TABLE HEADERS:
+     Forces header bars (like your budget table bar) to stay contextually visible */
+  .bg-black\/40, .bg-black\/50, div[class*="bg-black"] {
+    background-color: var(--color-card-header) !important;
+    color: var(--color-text-secondary) !important;
+  }
+
+  /* ⚡ THE ABSOLUTE FIX FOR HARDCODED DARK CARDS:
+      Overrides any remaining fixed dark background components universally */
+  .bg-\[\#161619\]\/60, .bg-\[\#161619\], div[class*="bg-[#161619]"] {
+    background-color: var(--color-bg-card) !important;
+    border-color: var(--color-border-main) !important;
+    color: var(--color-text-primary) !important;
+  }
+
+  /* Force root layers to full fluid height with auto overflow */
+  html, body, #root {
+    min-height: 100% !important;
+    height: auto !important;
+    overflow-y: auto !important;
+  }
+
+}
+
+
+/* ==========================================================================
+   ⚡ MASTER DYNAMIC EDGE-TO-EDGE VIEWPORT WIDTH OVERRIDE
+   ========================================================================== */
+
+/* 1. Force all container elements to collapse the 1536px box clamp */
+div, main, section, .flex-1, html, body {
+  max-width: 100% !important;
+  width: 100% !important;
+}
+
+/* 2. Release rigid layout centering block margins */
+.mx-auto, div[class*="mx-auto"] {
+  margin-left: 0 !important;
+  margin-right: 0 !important;
+}
+
+/* 3. No side-padding on main — edge-to-edge per user preference */
+main {
+  padding: 0 !important;
+}

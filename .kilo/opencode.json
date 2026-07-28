@@ -1,0 +1,13 @@
+{
+  "$schema": "https://opencode.ai",
+  "model": "bigmodel/glm-4-flash-250414",
+  "small_model": "bigmodel/glm-4-flash-250414",
+  "provider": {
+    "bigmodel": {
+      "options": {
+        "apiKey": "5398661f9d774cc188236f1b8515beb2.QnCefDRYorHTZEWh",
+        "baseURL": "https://open.bigmodel.cn/api/paas/v4"
+      }
+    }
+  }
+}
