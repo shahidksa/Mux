@@ -112,7 +112,7 @@ const getReportStyles = (isDarkMode: boolean) => `
 /* Different heights for different tables */
 .table-scroll-container.budget-scroll { max-height: 240px; }
 .table-scroll-container.activity-scroll { max-height: 320px; }
-.table-scroll-container.audit-scroll { max-height: 200px; }
+.table-scroll-container.audit-scroll { height: 200px; overflow-y: scroll !important; }
 
 /* Tables */
 .table-scroll-container {
